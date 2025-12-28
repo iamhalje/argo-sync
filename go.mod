@@ -1,4 +1,4 @@
-module argo-sync
+module github.com/iamhalje/argo-sync
 
 go 1.25.0
 

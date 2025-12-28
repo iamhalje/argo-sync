@@ -11,6 +11,7 @@ var (
 	Version   = "unknown"
 	Commit    = "unknown"
 	BuildDate = "unknown"
+	Repo      = "unknown"
 )
 
 func Short() string {
@@ -18,6 +19,7 @@ func Short() string {
 		fmt.Sprintf("version=%s", safe(Version)),
 		fmt.Sprintf("commit=%s", safe(Commit)),
 		fmt.Sprintf("date=%s", safe(BuildDate)),
+		fmt.Sprintf("repo=%s", safe(Repo)),
 		fmt.Sprintf("go=%s", runtime.Version()),
 	}
 	return strings.Join(parts, " ")

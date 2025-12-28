@@ -11,11 +11,15 @@ OUTDIR ?= ./bin
 VERSION ?= unknown
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+REPO ?= $(shell git config --get remote.origin.url 2>/dev/null || echo $(PKG_PREFIX))
+
+VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
 LDFLAGS ?= -s -w \
 	-X '$(PKG_PREFIX)/internal/buildinfo.Version=$(VERSION)' \
 	-X '$(PKG_PREFIX)/internal/buildinfo.Commit=$(COMMIT)' \
-	-X '$(PKG_PREFIX)/internal/buildinfo.BuildDate=$(BUILD_DATE)'
+	-X '$(PKG_PREFIX)/internal/buildinfo.BuildDate=$(BUILD_DATE)' \
+	-X '$(PKG_PREFIX)/internal/buildinfo.Repo=$(REPO)'
 
 TARGETOS ?= $(shell $(GO) env GOOS 2>/dev/null || echo linux)
 TARGETARCH ?= $(shell $(GO) env GOARCH 2>/dev/null || echo amd64)
@@ -44,6 +48,7 @@ build-docker:
 		--build-arg VERSION="$(VERSION)" \
 		--build-arg COMMIT="$(COMMIT)" \
 		--build-arg BUILD_DATE="$(BUILD_DATE)" \
+		--build-arg REPO="$(REPO)" \
 		-f Dockerfile .; \
 	cid=$$($(DOCKER) create "$$img"); \
 	$(DOCKER) cp "$$cid:/out/argo-sync" "$(CURDIR)/$(BIN)"; \
