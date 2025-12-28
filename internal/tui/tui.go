@@ -1,0 +1,1394 @@
+package tui
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/iamhalje/argo-sync/internal/argocd"
+	"github.com/iamhalje/argo-sync/internal/models"
+	"github.com/iamhalje/argo-sync/internal/services"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+type Options struct {
+	ConfigPath   string
+	Contexts     []string
+	Parallel     int
+	WaitTimeout  time.Duration
+	PollInterval time.Duration
+	NoWait       bool
+}
+
+func Run(ctx context.Context, logger *slog.Logger, opts Options) error {
+	api := argocd.NewGRPCAPI()
+	m := newModel(ctx, logger, api, opts)
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	_, err := p.Run()
+	return err
+}
+
+type step int
+
+const (
+	stepLoading step = iota
+	stepSelectApps
+	stepSelectClusters
+	stepSelectAction
+	stepConfirm
+	stepRunning
+	stepDone
+	stepError
+)
+
+// all tui.
+type model struct {
+	rootCtx context.Context
+	cancel  context.CancelFunc
+	logger  *slog.Logger
+
+	api       argocd.API
+	discover  *services.DiscoveryService
+	bulk      *services.BulkService
+	clusters  []models.Cluster
+	clusterBy map[string]models.Cluster
+	inv       models.Inventory
+	loadErrs  map[string]error
+
+	step step
+	err  error
+
+	cursor int
+	width  int
+	height int
+
+	appOffset int
+	clOffset  int
+
+	appKeysAll   []models.AppKey
+	appKeys      []models.AppKey
+	appSelected  map[models.AppKey]bool
+	clusterNames []string
+	clSelected   map[string]bool
+
+	filtering  bool
+	filter     textinput.Model
+	refreshing bool
+
+	actionIdx int
+	action    models.Action
+	runOpts   models.RunOptions
+
+	eventsCh chan models.ProgressEvent
+	doneCh   chan runDoneMsg
+	results  []models.Result
+	statuses map[models.Target]models.TaskStatus
+	messages map[models.Target]string
+	errors   map[models.Target]error
+
+	cli Options
+}
+
+func newModel(ctx context.Context, logger *slog.Logger, api argocd.API, opts Options) *model {
+	runCtx, cancel := context.WithCancel(ctx)
+	ti := textinput.New()
+	ti.Prompt = "/ "
+	ti.Placeholder = "type to filter apps (Esc clears)"
+	ti.CharLimit = 64
+	ti.Width = 40
+	ti.Blur()
+	return &model{
+		rootCtx:     runCtx,
+		cancel:      cancel,
+		logger:      logger,
+		api:         api,
+		discover:    services.NewDiscoveryService(api),
+		bulk:        services.NewBulkService(api, opts.Parallel),
+		step:        stepLoading,
+		appSelected: map[models.AppKey]bool{},
+		clSelected:  map[string]bool{},
+		filter:      ti,
+		statuses:    map[models.Target]models.TaskStatus{},
+		messages:    map[models.Target]string{},
+		errors:      map[models.Target]error{},
+		action:      models.ActionSync,
+		runOpts: models.RunOptions{
+			Wait:         !opts.NoWait,
+			WaitHealthy:  !opts.NoWait,
+			WaitTimeout:  opts.WaitTimeout,
+			PollInterval: opts.PollInterval,
+		},
+		cli: opts,
+	}
+}
+
+type loadDoneMsg struct {
+	clusters []models.Cluster
+	inv      models.Inventory
+	errs     map[string]error
+	err      error
+}
+
+type refreshDoneMsg struct {
+	clusters []models.Cluster
+	inv      models.Inventory
+	errs     map[string]error
+	err      error
+}
+
+type progressMsg models.ProgressEvent
+type eventsClosedMsg struct{}
+type runDoneMsg struct {
+	results []models.Result
+	err     error
+}
+
+func (m *model) Init() tea.Cmd {
+	return m.loadCmd()
+}
+
+func (m *model) loadCmd() tea.Cmd {
+	return func() tea.Msg {
+		m.logger.Debug("loading clusters", slog.String("config", m.cli.ConfigPath), slog.Any("contexts", m.cli.Contexts))
+		clusters, err := argocd.LoadClustersFromFile(m.cli.ConfigPath)
+		if err != nil {
+			m.logger.Debug("failed to load clusters", slog.Any("err", err))
+			return loadDoneMsg{err: err}
+		}
+		clusters = filterClusters(clusters, m.cli.Contexts)
+		if len(clusters) == 0 {
+			return loadDoneMsg{err: fmt.Errorf("no contexts selected")}
+		}
+		m.logger.Debug("clusters loaded", slog.Int("count", len(clusters)))
+		start := time.Now()
+		inv, errs, err := m.discover.DiscoverInventory(m.rootCtx, clusters)
+		if err != nil {
+			m.logger.Debug("inventory discovery failed", slog.Any("err", err), slog.Int("clusters", len(clusters)), slog.Int("cluster_errors", len(errs)))
+			return loadDoneMsg{err: err, errs: errs}
+		}
+		m.logger.Debug("inventory discovered", slog.Duration("took", time.Since(start)), slog.Int("clusters", len(clusters)), slog.Int("apps", len(inv)), slog.Int("cluster_errors", len(errs)))
+		if len(errs) > 0 {
+			for k, e := range errs {
+				m.logger.Debug("cluster discovery error", slog.String("context", k), slog.Any("err", e))
+			}
+		}
+		return loadDoneMsg{clusters: clusters, inv: inv, errs: errs}
+	}
+}
+
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		// keep offsets after resize
+		m.appOffset = clamp(m.appOffset, 0, max(0, len(m.appKeys)-1))
+		m.clOffset = clamp(m.clOffset, 0, max(0, len(m.clusterNames)-1))
+		m.ensureVisible()
+		return m, nil
+	case tea.KeyMsg:
+		return m.onKey(msg)
+	case loadDoneMsg:
+		if msg.err != nil {
+			m.step = stepError
+			m.err = msg.err
+			return m, nil
+		}
+		m.clusters = msg.clusters
+		m.clusterBy = map[string]models.Cluster{}
+		for _, c := range m.clusters {
+			m.clusterBy[c.ContextName] = c
+		}
+		m.inv = msg.inv
+		m.loadErrs = msg.errs
+		m.appKeysAll = services.InventoryKeys(m.inv)
+		m.appKeys = m.appKeysAll
+		m.step = stepSelectApps
+		m.cursor = 0
+		m.appOffset = 0
+		return m, nil
+	case refreshDoneMsg:
+		m.refreshing = false
+		if msg.err != nil {
+			m.loadErrs = msg.errs
+			m.err = msg.err
+			return m, nil
+		}
+
+		var prev models.AppKey
+		hasPrev := false
+		if m.cursor >= 0 && m.cursor < len(m.appKeys) {
+			prev = m.appKeys[m.cursor]
+			hasPrev = true
+		}
+
+		m.clusters = msg.clusters
+		m.clusterBy = map[string]models.Cluster{}
+		for _, c := range m.clusters {
+			m.clusterBy[c.ContextName] = c
+		}
+		m.inv = msg.inv
+		m.loadErrs = msg.errs
+		m.appKeysAll = services.InventoryKeys(m.inv)
+		m.applyAppFilter()
+		// drop sections for app that no longer exists
+		if len(m.appSelected) > 0 {
+			exists := map[models.AppKey]struct{}{}
+			for _, k := range m.appKeysAll {
+				exists[k] = struct{}{}
+			}
+			for k := range m.appSelected {
+				if _, ok := exists[k]; !ok {
+					delete(m.appSelected, k)
+				}
+			}
+		}
+		if hasPrev {
+			if idx := indexOfAppKey(m.appKeys, prev); idx >= 0 {
+				m.cursor = idx
+			} else {
+				m.cursor = clamp(m.cursor, 0, max(0, len(m.appKeys)-1))
+			}
+		} else {
+			m.cursor = clamp(m.cursor, 0, max(0, len(m.appKeys)-1))
+		}
+		m.ensureVisible()
+		return m, nil
+	case progressMsg:
+		ev := models.ProgressEvent(msg)
+		m.statuses[ev.Target] = ev.Phase
+		if ev.Message != "" {
+			m.messages[ev.Target] = ev.Message
+		}
+		if ev.Err != nil {
+			m.errors[ev.Target] = ev.Err
+		}
+		m.logger.Debug("progress", slog.String("context", ev.Target.ClusterContext), slog.String("app", ev.Target.App.Name), slog.String("action", string(ev.Action)), slog.String("phase", string(ev.Phase)), slog.String("message", ev.Message), slog.Any("err", ev.Err))
+		return m, waitForEvent(m.eventsCh)
+	case eventsClosedMsg:
+		return m, nil
+	case runDoneMsg:
+		m.results = msg.results
+		if msg.err != nil {
+			m.step = stepError
+			m.err = msg.err
+			return m, nil
+		}
+		m.step = stepDone
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		m.cancel()
+		return m, tea.Quit
+	}
+
+	switch m.step {
+	case stepLoading:
+		if msg.String() == "q" || msg.String() == "esc" {
+			m.cancel()
+			return m, tea.Quit
+		}
+		return m, nil
+
+	case stepError:
+		if msg.String() == "q" || msg.String() == "esc" || msg.String() == "enter" {
+			m.cancel()
+			return m, tea.Quit
+		}
+		return m, nil
+
+	case stepSelectApps:
+		return m.onKeySelectApps(msg)
+	case stepSelectClusters:
+		return m.onKeySelectClusters(msg)
+	case stepSelectAction:
+		return m.onKeySelectAction(msg)
+	case stepConfirm:
+		return m.onKeyConfirm(msg)
+	case stepRunning:
+		// allow cancel in running
+		if msg.String() == "q" || msg.String() == "esc" {
+			m.cancel()
+			return m, nil
+		}
+		return m, nil
+	case stepDone:
+		switch msg.String() {
+		case "q", "esc":
+			return m, tea.Quit
+		case "r":
+			m.resetToStart()
+			return m, nil
+		case "enter":
+			return m, tea.Quit
+		default:
+			return m, nil
+		}
+	default:
+		return m, nil
+	}
+}
+
+func (m *model) onKeySelectApps(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// filters
+	if m.filtering {
+		switch msg.String() {
+		case "esc":
+			m.filtering = false
+			m.filter.Blur()
+			m.filter.SetValue("")
+			m.applyAppFilter()
+			return m, nil
+		case "enter":
+			m.filtering = false
+			m.filter.Blur()
+			m.applyAppFilter()
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.filter, cmd = m.filter.Update(msg)
+			m.applyAppFilter()
+			return m, cmd
+		}
+	}
+
+	switch msg.String() {
+	case "q", "esc":
+		// if a filter is active, esc clears it else otherwise quit.
+		if m.filter.Value() != "" {
+			m.filter.SetValue("")
+			m.applyAppFilter()
+			return m, nil
+		}
+		return m, tea.Quit
+	case "/", "ctrl+f":
+		m.filtering = true
+		m.filter.Focus()
+		return m, nil
+	case "R", "ctrl+r":
+		if !m.refreshing {
+			m.refreshing = true
+			return m, m.refreshCmd()
+		}
+		return m, nil
+	case "up":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+		m.ensureVisible()
+		return m, nil
+	case "down":
+		if m.cursor < len(m.appKeys)-1 {
+			m.cursor++
+		}
+		m.ensureVisible()
+		return m, nil
+	case "pgup":
+		h := m.appsListHeight()
+		if h <= 0 {
+			h = 10
+		}
+		m.cursor -= h
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		m.ensureVisible()
+		return m, nil
+	case "pgdown":
+		h := m.appsListHeight()
+		if h <= 0 {
+			h = 10
+		}
+		m.cursor += h
+		if m.cursor > len(m.appKeys)-1 {
+			m.cursor = len(m.appKeys) - 1
+		}
+		m.ensureVisible()
+		return m, nil
+	case " ":
+		if len(m.appKeys) == 0 {
+			return m, nil
+		}
+		k := m.appKeys[m.cursor]
+		m.appSelected[k] = !m.appSelected[k]
+		return m, nil
+	case "a":
+		all := true
+		for _, k := range m.appKeys {
+			if !m.appSelected[k] {
+				all = false
+				break
+			}
+		}
+		for _, k := range m.appKeys {
+			m.appSelected[k] = !all
+		}
+		return m, nil
+	case "enter":
+		apps := m.selectedApps()
+		if len(apps) == 0 {
+			return m, nil
+		}
+		cl, err := services.ClustersForApps(m.inv, apps)
+		if err != nil {
+			m.step = stepError
+			m.err = err
+			return m, nil
+		}
+		m.clusterNames = cl
+		m.clSelected = map[string]bool{}
+		// default: all
+		for _, c := range cl {
+			m.clSelected[c] = true
+		}
+		m.cursor = 0
+		m.clOffset = 0
+		m.step = stepSelectClusters
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+func (m *model) onKeySelectClusters(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc":
+		return m, tea.Quit
+	case "backspace":
+		m.cursor = 0
+		m.appOffset = 0
+		m.step = stepSelectApps
+		return m, nil
+	case "up":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+		m.ensureVisible()
+		return m, nil
+	case "down":
+		if m.cursor < len(m.clusterNames)-1 {
+			m.cursor++
+		}
+		m.ensureVisible()
+		return m, nil
+	case "pgup":
+		h := m.clustersListHeight()
+		if h <= 0 {
+			h = 10
+		}
+		m.cursor -= h
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		m.ensureVisible()
+		return m, nil
+	case "pgdown":
+		h := m.clustersListHeight()
+		if h <= 0 {
+			h = 10
+		}
+		m.cursor += h
+		if m.cursor > len(m.clusterNames)-1 {
+			m.cursor = len(m.clusterNames) - 1
+		}
+		m.ensureVisible()
+		return m, nil
+	case " ":
+		if len(m.clusterNames) == 0 {
+			return m, nil
+		}
+		c := m.clusterNames[m.cursor]
+		m.clSelected[c] = !m.clSelected[c]
+		return m, nil
+	case "a":
+		all := true
+		for _, c := range m.clusterNames {
+			if !m.clSelected[c] {
+				all = false
+				break
+			}
+		}
+		for _, c := range m.clusterNames {
+			m.clSelected[c] = !all
+		}
+		return m, nil
+	case "enter":
+		if len(m.selectedClusters()) == 0 {
+			return m, nil
+		}
+		m.cursor = 0
+		m.step = stepSelectAction
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+func (m *model) onKeySelectAction(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	actions := []models.Action{models.ActionSync, models.ActionRefresh, models.ActionHardRefresh}
+	switch msg.String() {
+	case "q", "esc":
+		return m, tea.Quit
+	case "backspace":
+		m.cursor = 0
+		m.step = stepSelectClusters
+		return m, nil
+	case "up":
+		if m.actionIdx > 0 {
+			m.actionIdx--
+		}
+		return m, nil
+	case "down":
+		if m.actionIdx < len(actions)-1 {
+			m.actionIdx++
+		}
+		return m, nil
+	case "r":
+		// pre-refresh is only applicable to Sync
+		if m.actionIdx == 0 {
+			m.runOpts.PreRefresh = !m.runOpts.PreRefresh
+			if m.runOpts.PreRefresh {
+				m.runOpts.PreHardRefresh = false
+			}
+		}
+		return m, nil
+	case "h":
+		// pre-hard-refresh is only applicable to Sync
+		if m.actionIdx == 0 {
+			m.runOpts.PreHardRefresh = !m.runOpts.PreHardRefresh
+			if m.runOpts.PreHardRefresh {
+				m.runOpts.PreRefresh = false
+			}
+		}
+		return m, nil
+	case "p":
+		// prune is only applicable to Sync
+		if m.actionIdx == 0 {
+			m.runOpts.Prune = !m.runOpts.Prune
+		}
+		return m, nil
+	case "d":
+		// dry-run is only applicable to Sync
+		if m.actionIdx == 0 {
+			m.runOpts.DryRun = !m.runOpts.DryRun
+		}
+		return m, nil
+	case "o":
+		// apply-only is only applicable to Sync
+		if m.actionIdx == 0 {
+			m.runOpts.ApplyOnly = !m.runOpts.ApplyOnly
+		}
+		return m, nil
+	case "f":
+		// force is only applicable to Sync
+		if m.actionIdx == 0 {
+			m.runOpts.Force = !m.runOpts.Force
+		}
+		return m, nil
+	case "enter":
+		m.action = actions[m.actionIdx]
+		// flags require confirmation
+		if m.action == models.ActionSync && (m.runOpts.Prune || m.runOpts.Force) {
+			m.step = stepConfirm
+			return m, nil
+		}
+		return m.startRun()
+	default:
+		return m, nil
+	}
+}
+
+func (m *model) onKeyConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch strings.ToLower(msg.String()) {
+	case "y":
+		return m.startRun()
+	case "n", "esc", "q":
+		m.step = stepSelectAction
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+func (m *model) startRun() (tea.Model, tea.Cmd) {
+	m.step = stepRunning
+	m.statuses = map[models.Target]models.TaskStatus{}
+	m.messages = map[models.Target]string{}
+	m.errors = map[models.Target]error{}
+	m.results = nil
+	m.eventsCh = make(chan models.ProgressEvent, 256)
+	m.doneCh = make(chan runDoneMsg, 1)
+
+	action := m.action
+	opts := m.runOpts
+	_ = action
+
+	apps := m.selectedApps()
+	clusters := m.selectedClusters()
+
+	m.logger.Debug("starting bulk run", slog.String("action", string(action)), slog.Int("selected_apps", len(apps)), slog.Int("selected_clusters", len(clusters)), slog.Bool("wait", opts.Wait), slog.Bool("wait_healthy", opts.WaitHealthy), slog.Duration("wait_timeout", opts.WaitTimeout), slog.Duration("poll_interval", opts.PollInterval), slog.Bool("prune", opts.Prune), slog.Bool("dry_run", opts.DryRun), slog.Bool("apply_only", opts.ApplyOnly), slog.Bool("force", opts.Force), slog.Int("parallel", m.cli.Parallel))
+
+	go func() {
+		start := time.Now()
+		results, err := m.bulk.Run(m.rootCtx, m.inv, m.clusterBy, apps, clusters, action, opts, m.eventsCh)
+		close(m.eventsCh)
+		if err != nil {
+			m.logger.Error("bulk run failed", slog.Any("err", err))
+		}
+		success := 0
+		failed := 0
+		for _, r := range results {
+			switch r.Status {
+			case models.TaskSuccess:
+				success++
+			case models.TaskFailed:
+				failed++
+			}
+		}
+		m.logger.Debug("bulk run finished", slog.Duration("took", time.Since(start)), slog.Int("results", len(results)), slog.Int("success", success), slog.Int("failed", failed), slog.Any("err", err))
+		m.doneCh <- runDoneMsg{results: results, err: err}
+		close(m.doneCh)
+	}()
+
+	return m, tea.Batch(
+		waitForEvent(m.eventsCh),
+		waitForDone(m.doneCh),
+	)
+}
+
+func waitForEvent(ch <-chan models.ProgressEvent) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return eventsClosedMsg{}
+		}
+		return progressMsg(ev)
+	}
+}
+
+func waitForDone(ch <-chan runDoneMsg) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return runDoneMsg{}
+		}
+		return msg
+	}
+}
+
+func (m *model) View() string {
+	theme := styles()
+	switch m.step {
+	case stepLoading:
+		return theme.header.Render("argo-sync") + "\n\n" + "Loading Argo CD contexts & applications…\n\n" + theme.hint.Render("Ctrl+C to exit")
+	case stepError:
+		return theme.header.Render("argo-sync") + "\n\n" + theme.error.Render(fmt.Sprintf("Error: %v", m.err)) + "\n\n" + theme.hint.Render("Enter/Esc to exit")
+	case stepSelectApps:
+		return m.viewSelectApps(theme)
+	case stepSelectClusters:
+		return m.viewSelectClusters(theme)
+	case stepSelectAction:
+		return m.viewSelectAction(theme)
+	case stepConfirm:
+		return m.viewConfirm(theme)
+	case stepRunning:
+		return m.viewRunning(theme)
+	case stepDone:
+		return m.viewDone(theme)
+	default:
+		return "unknown state"
+	}
+}
+
+type uiStyles struct {
+	header lipgloss.Style
+	hint   lipgloss.Style
+	error  lipgloss.Style
+	ok     lipgloss.Style
+	warn   lipgloss.Style
+	dim    lipgloss.Style
+}
+
+func styles() uiStyles {
+	// https://github.com/charmbracelet/lipgloss?tab=readme-ov-file#borders
+	return uiStyles{
+		header: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")),
+		hint:   lipgloss.NewStyle().Foreground(lipgloss.Color("241")),
+		error:  lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true),
+		ok:     lipgloss.NewStyle().Foreground(lipgloss.Color("42")),
+		warn:   lipgloss.NewStyle().Foreground(lipgloss.Color("214")),
+		dim:    lipgloss.NewStyle().Foreground(lipgloss.Color("240")),
+	}
+}
+
+func (m *model) selectedApps() []models.AppKey {
+	out := make([]models.AppKey, 0, len(m.appSelected))
+	for _, k := range m.appKeysAll {
+		if m.appSelected[k] {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+func (m *model) selectedClusters() []string {
+	out := make([]string, 0, len(m.clSelected))
+	for _, c := range m.clusterNames {
+		if m.clSelected[c] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (m *model) viewSelectApps(s uiStyles) string {
+	var b strings.Builder
+	b.WriteString(fitLine(m.width, s.header.Render("Step 1/3: Select Applications")))
+	b.WriteString("\n")
+	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | / or Ctrl+F filter | R refresh | Enter next | q quit")))
+	b.WriteString("\n")
+	if m.filtering || m.filter.Value() != "" {
+		if m.filtering {
+			b.WriteString(fitLine(m.width, m.filter.View()))
+		} else {
+			b.WriteString(fitLine(m.width, s.dim.Render(fmt.Sprintf("Filter: %s (press / or Ctrl+F to edit, Esc to clear)", m.filter.Value()))))
+		}
+	}
+	b.WriteString("\n\n")
+
+	if m.refreshing {
+		b.WriteString(fitLine(m.width, s.header.Render("Refreshing application statuses...")))
+		b.WriteString("\n\n")
+	}
+
+	if len(m.loadErrs) > 0 {
+		// keep it compact: show up to 3 errors + summary
+		type kv struct {
+			k string
+			v error
+		}
+		items := make([]kv, 0, len(m.loadErrs))
+		for k, v := range m.loadErrs {
+			items = append(items, kv{k: k, v: v})
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].k < items[j].k })
+		show := items
+		if len(show) > 3 {
+			show = show[:3]
+		}
+
+		b.WriteString(s.warn.Render("Some clusters failed to list applications:"))
+		b.WriteString("\n")
+		for _, it := range show {
+			b.WriteString(s.dim.Render(fmt.Sprintf("- %s: %s", it.k, truncate(it.v.Error(), 120))))
+			b.WriteString("\n")
+		}
+		if len(items) > len(show) {
+			b.WriteString(s.dim.Render(fmt.Sprintf("…and %d more", len(items)-len(show))))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	if len(m.appKeys) == 0 {
+		b.WriteString(s.dim.Render("applications not found"))
+		return b.String()
+	}
+
+	start, end := m.appsVisibleRange()
+	for i := start; i < end; i++ {
+		k := m.appKeys[i]
+		cursor := " "
+		if i == m.cursor {
+			cursor = ">"
+		}
+		check := "[ ]"
+		if m.appSelected[k] {
+			check = "[x]"
+		}
+		clusters := make([]string, 0, len(m.inv[k]))
+		for c := range m.inv[k] {
+			clusters = append(clusters, c)
+		}
+		sort.Strings(clusters)
+
+		// show up to 3 clusters as "ctx:healths" and "+N"
+		lineClusters := clusters
+		if len(lineClusters) > 3 {
+			lineClusters = lineClusters[:3]
+		}
+		var parts []string
+		for _, c := range lineClusters {
+			app := m.inv[k][c]
+			parts = append(parts, fmt.Sprintf("%s:%s", c, renderAppStateShort(s, app)))
+		}
+		if len(clusters) > len(lineClusters) {
+			parts = append(parts, s.dim.Render(fmt.Sprintf("+%d", len(clusters)-len(lineClusters))))
+		}
+		b.WriteString(fmt.Sprintf("%s %s %-40s %s\n", cursor, check, k.Name, strings.Join(parts, " ")))
+	}
+	b.WriteString(s.dim.Render(fmt.Sprintf("Showing %d–%d of %d", start+1, end, len(m.appKeys))))
+	b.WriteString("\n")
+
+	if m.cursor >= 0 && m.cursor < len(m.appKeys) {
+		k := m.appKeys[m.cursor]
+		b.WriteString("\n")
+		b.WriteString(s.dim.Render("Details: "))
+		b.WriteString(k.Name)
+		b.WriteString("\n")
+
+		clusters := make([]string, 0, len(m.inv[k]))
+		for c := range m.inv[k] {
+			clusters = append(clusters, c)
+		}
+		sort.Strings(clusters)
+		for _, c := range clusters {
+			a := m.inv[k][c]
+			b.WriteString(fmt.Sprintf("  %-24s %s  %s\n",
+				c,
+				renderAppHealth(s, a.HealthStatus),
+				renderAppSync(s, a.SyncStatus),
+			))
+		}
+	}
+	return b.String()
+}
+
+func (m *model) viewSelectClusters(s uiStyles) string {
+	var b strings.Builder
+	b.WriteString(fitLine(m.width, s.header.Render("Step 2/3: Select Clusters")))
+	b.WriteString("\n")
+	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | Backspace back | Enter next | q quit")))
+	b.WriteString("\n\n")
+
+	start, end := m.clustersVisibleRange()
+	for i := start; i < end; i++ {
+		c := m.clusterNames[i]
+		cursor := " "
+		if i == m.cursor {
+			cursor = ">"
+		}
+		check := "[ ]"
+		if m.clSelected[c] {
+			check = "[x]"
+		}
+		b.WriteString(fmt.Sprintf("%s %s %s\n", cursor, check, c))
+	}
+	if len(m.clusterNames) > 0 {
+		b.WriteString(s.dim.Render(fmt.Sprintf("Showing %d–%d of %d", start+1, end, len(m.clusterNames))))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func (m *model) viewSelectAction(s uiStyles) string {
+	actions := []models.Action{models.ActionSync, models.ActionRefresh, models.ActionHardRefresh}
+	labels := map[models.Action]string{
+		models.ActionSync:        "sync",
+		models.ActionRefresh:     "refresh",
+		models.ActionHardRefresh: "hard refresh",
+	}
+
+	var b strings.Builder
+	b.WriteString(fitLine(m.width, s.header.Render("Step 3/3: Operation")))
+	b.WriteString("\n")
+	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | Enter run | Backspace back | q quit")))
+	b.WriteString("\n\n")
+
+	for i, a := range actions {
+		cursor := " "
+		if i == m.actionIdx {
+			cursor = ">"
+		}
+		b.WriteString(fmt.Sprintf("%s  %s\n", cursor, labels[a]))
+	}
+
+	b.WriteString("\n")
+	b.WriteString(s.dim.Render("Options:"))
+	b.WriteString("\n")
+	if m.actionIdx == 0 {
+		b.WriteString(fmt.Sprintf("  [%s] pre-refresh before sync (r)", onOff(m.runOpts.PreRefresh)))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  [%s] pre-hard-refresh before sync (h)", onOff(m.runOpts.PreHardRefresh)))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  [%s] prune for sync (p)", onOff(m.runOpts.Prune)))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  [%s] dry-run (no changes) (d)", onOff(m.runOpts.DryRun)))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  [%s] apply-only strategy (o)", onOff(m.runOpts.ApplyOnly)))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  [%s] force apply (f)", onOff(m.runOpts.Force)))
+		b.WriteString("\n")
+	} else {
+		b.WriteString(s.dim.Render(fmt.Sprintf("  [%s] pre-refresh before sync (r)", onOff(m.runOpts.PreRefresh))))
+		b.WriteString("\n")
+		b.WriteString(s.dim.Render(fmt.Sprintf("  [%s] pre-hard-refresh before sync (h)", onOff(m.runOpts.PreHardRefresh))))
+		b.WriteString("\n")
+		b.WriteString(s.dim.Render(fmt.Sprintf("  [%s] prune for sync (p)", onOff(m.runOpts.Prune))))
+		b.WriteString("\n")
+		b.WriteString(s.dim.Render(fmt.Sprintf("  [%s] dry-run (no changes) (d)", onOff(m.runOpts.DryRun))))
+		b.WriteString("\n")
+		b.WriteString(s.dim.Render(fmt.Sprintf("  [%s] apply-only strategy (o)", onOff(m.runOpts.ApplyOnly))))
+		b.WriteString("\n")
+		b.WriteString(s.dim.Render(fmt.Sprintf("  [%s] force apply (f)", onOff(m.runOpts.Force))))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func (m *model) viewConfirm(s uiStyles) string {
+	var b strings.Builder
+	b.WriteString(s.header.Render("Confirm operation"))
+	b.WriteString("\n\n")
+	if m.runOpts.Prune {
+		b.WriteString(s.warn.Render("Prune is enabled. This may delete resources managed by Argo CD."))
+		b.WriteString("\n")
+	}
+	if m.runOpts.Force {
+		b.WriteString(s.warn.Render("Force is enabled. This may replace fields or recreate resources."))
+		b.WriteString("\n")
+	}
+	if !m.runOpts.Prune && !m.runOpts.Force {
+		b.WriteString(s.warn.Render("Proceed with the selected sync options?"))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n\n")
+	b.WriteString(s.hint.Render("Press y to confirm, n to go back"))
+	return b.String()
+}
+
+func (m *model) viewRunning(s uiStyles) string {
+	var b strings.Builder
+	b.WriteString(s.header.Render("Running…"))
+	b.WriteString("\n")
+	b.WriteString(s.hint.Render("q/esc cancels. Ctrl+C quits immediately."))
+	b.WriteString("\n\n")
+
+	apps := m.selectedApps()
+	clusters := m.selectedClusters()
+
+	total := 0
+	success := 0
+	failed := 0
+
+	for _, c := range clusters {
+		for _, a := range apps {
+			if _, ok := m.inv[a][c]; !ok {
+				continue
+			}
+			total++
+			t := models.Target{ClusterContext: c, App: a}
+			st := m.statuses[t]
+			switch st {
+			case models.TaskSuccess:
+				success++
+			case models.TaskFailed:
+				failed++
+			}
+
+			b.WriteString(fmt.Sprintf("%-24s %-40s %s", c, a.Name, renderStatus(s, st)))
+			if msg := m.messages[t]; msg != "" {
+				b.WriteString("\n")
+				b.WriteString(s.dim.Render("  ↳ " + truncate(msg, 120)))
+			}
+			if err := m.errors[t]; err != nil {
+				b.WriteString("\n")
+				b.WriteString(s.error.Render("  ↳ " + truncate(err.Error(), 120)))
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	b.WriteString("\n")
+	b.WriteString(s.dim.Render(fmt.Sprintf("Total: %d  Success: %d  Failed: %d  Updated: %s", total, success, failed, time.Now().Format("15:04:05"))))
+	return b.String()
+}
+
+func (m *model) viewDone(s uiStyles) string {
+	var b strings.Builder
+	b.WriteString(fitLine(m.width, s.header.Render("Done")))
+	b.WriteString("\n\n")
+
+	success := 0
+	failed := 0
+	for _, st := range m.statuses {
+		switch st {
+		case models.TaskSuccess:
+			success++
+		case models.TaskFailed:
+			failed++
+		}
+	}
+
+	b.WriteString(fmt.Sprintf("%s %d\n", s.ok.Render("success:"), success))
+	b.WriteString(fmt.Sprintf("%s %d\n", s.error.Render("failed:"), failed))
+	b.WriteString("\n")
+	b.WriteString(fitLine(m.width, s.hint.Render("r restart  Enter/q to exit")))
+	return b.String()
+}
+
+func onOff(v bool) string {
+	if v {
+		return "x"
+	}
+	return " "
+}
+
+func renderStatus(s uiStyles, st models.TaskStatus) string {
+	switch st {
+	case models.TaskRunning:
+		return s.warn.Render("running")
+	case models.TaskSuccess:
+		return s.ok.Render("success")
+	case models.TaskFailed:
+		return s.error.Render("failed")
+	default:
+		return s.dim.Render("pending")
+	}
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 3 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
+}
+
+func renderAppStateShort(s uiStyles, a models.Application) string {
+	h := shortHealth(a.HealthStatus)
+	sy := shortSync(a.SyncStatus)
+
+	if isHealthRed(a.HealthStatus) {
+		return s.error.Render(h + sy)
+	}
+	if isHealthYellow(a.HealthStatus) || isSyncYellow(a.SyncStatus) {
+		return s.warn.Render(h + sy)
+	}
+	if isHealthGreen(a.HealthStatus) && isSyncGreen(a.SyncStatus) {
+		return s.ok.Render(h + sy)
+	}
+	return s.dim.Render(h + sy)
+}
+
+func renderAppHealth(s uiStyles, health string) string {
+	label := "health=" + norm(health)
+	switch {
+	case isHealthRed(health):
+		return s.error.Render(label)
+	case isHealthYellow(health):
+		return s.warn.Render(label)
+	case isHealthGreen(health):
+		return s.ok.Render(label)
+	default:
+		return s.dim.Render(label)
+	}
+}
+
+func renderAppSync(s uiStyles, sync string) string {
+	label := "sync=" + norm(sync)
+	switch {
+	case isSyncGreen(sync):
+		return s.ok.Render(label)
+	case isSyncYellow(sync):
+		return s.warn.Render(label)
+	default:
+		return s.dim.Render(label)
+	}
+}
+
+func norm(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "Unknown"
+	}
+	return v
+}
+
+// https://github.com/argoproj/argo-cd/blob/master/gitops-engine/pkg/health/health.go#L14
+func shortHealth(v string) string {
+	switch strings.TrimSpace(v) {
+	case "Healthy":
+		return "H"
+	case "Degraded":
+		return "D"
+	case "Progressing":
+		return "P"
+	case "Suspended":
+		return "S"
+	case "Missing":
+		return "M"
+	case "Unknown":
+		return "U"
+	default:
+		return "?"
+	}
+}
+
+func shortSync(v string) string {
+	switch strings.TrimSpace(v) {
+	case "Synced":
+		return "S"
+	case "OutOfSync":
+		return "O"
+	default:
+		return "?"
+	}
+}
+
+func isHealthGreen(v string) bool {
+	return strings.TrimSpace(v) == "Healthy"
+}
+
+func isHealthYellow(v string) bool {
+	switch strings.TrimSpace(v) {
+	case "Progressing", "Suspended":
+		return true
+	default:
+		return false
+	}
+}
+
+func isHealthRed(v string) bool {
+	switch strings.TrimSpace(v) {
+	case "Degraded", "Missing":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSyncGreen(v string) bool {
+	return strings.TrimSpace(v) == "Synced"
+}
+
+func isSyncYellow(v string) bool {
+	return strings.TrimSpace(v) == "OutOfSync"
+}
+
+func (m *model) resetToStart() {
+	m.step = stepSelectApps
+	m.cursor = 0
+	m.appOffset = 0
+	m.clOffset = 0
+
+	m.appSelected = map[models.AppKey]bool{}
+	m.clSelected = map[string]bool{}
+	m.clusterNames = nil
+
+	m.actionIdx = 0
+	m.action = models.ActionSync
+	m.runOpts = models.RunOptions{
+		Wait:         !m.cli.NoWait,
+		WaitHealthy:  !m.cli.NoWait,
+		WaitTimeout:  m.cli.WaitTimeout,
+		PollInterval: m.cli.PollInterval,
+	}
+
+	m.statuses = map[models.Target]models.TaskStatus{}
+	m.errors = map[models.Target]error{}
+	m.results = nil
+}
+
+func (m *model) ensureVisible() {
+	switch m.step {
+	case stepSelectApps:
+		h := m.appsListHeight()
+		m.appOffset = ensureOffset(m.appOffset, m.cursor, h, len(m.appKeys))
+	case stepSelectClusters:
+		h := m.clustersListHeight()
+		m.clOffset = ensureOffset(m.clOffset, m.cursor, h, len(m.clusterNames))
+	default:
+		// nothing
+	}
+}
+
+func (m *model) appsVisibleRange() (start, end int) {
+	h := m.appsListHeight()
+	if h <= 0 {
+		h = 20
+	}
+	start = clamp(m.appOffset, 0, max(0, len(m.appKeys)-1))
+	end = min(len(m.appKeys), start+h)
+	return start, end
+}
+
+func (m *model) clustersVisibleRange() (start, end int) {
+	h := m.clustersListHeight()
+	if h <= 0 {
+		h = 20
+	}
+	start = clamp(m.clOffset, 0, max(0, len(m.clusterNames)-1))
+	end = min(len(m.clusterNames), start+h)
+	return start, end
+}
+
+func (m *model) appsListHeight() int {
+	if m.height <= 0 {
+		return 20
+	}
+	header := 4
+	if m.filtering || m.filter.Value() != "" {
+		header += 1
+	}
+	warnings := m.warningBlockHeight()
+	details := m.detailsBlockHeight()
+	footer := 1
+	available := m.height - header - warnings - details - footer - 1
+	return max(5, available)
+}
+
+func (m *model) applyAppFilter() {
+	q := strings.TrimSpace(m.filter.Value())
+	if q == "" {
+		m.appKeys = m.appKeysAll
+		m.cursor = clamp(m.cursor, 0, max(0, len(m.appKeys)-1))
+		m.ensureVisible()
+		return
+	}
+	q = strings.ToLower(q)
+	out := make([]models.AppKey, 0, len(m.appKeysAll))
+	for _, k := range m.appKeysAll {
+		if strings.Contains(strings.ToLower(k.Name), q) {
+			out = append(out, k)
+		}
+	}
+	m.appKeys = out
+	m.cursor = 0
+	m.appOffset = 0
+	m.ensureVisible()
+}
+
+func (m *model) clustersListHeight() int {
+	if m.height <= 0 {
+		return 20
+	}
+	header := 3
+	footer := 1
+	available := m.height - header - footer - 1
+	return max(5, available)
+}
+
+func (m *model) warningBlockHeight() int {
+	if len(m.loadErrs) == 0 {
+		return 0
+	}
+	show := min(3, len(m.loadErrs))
+	extra := 0
+	if len(m.loadErrs) > show {
+		extra = 1
+	}
+	return 1 + show + extra + 1
+}
+
+func (m *model) detailsBlockHeight() int {
+	if m.cursor < 0 || m.cursor >= len(m.appKeys) {
+		return 0
+	}
+	k := m.appKeys[m.cursor]
+	n := len(m.inv[k])
+	if n == 0 {
+		return 0
+	}
+	// blank + "Details: " + up to 8 cluster lines
+	return 1 + 1 + min(n, 8)
+}
+
+func ensureOffset(offset, cursor, height, total int) int {
+	if total <= 0 {
+		return 0
+	}
+	if height <= 0 {
+		height = 1
+	}
+	if cursor < offset {
+		return cursor
+	}
+	if cursor >= offset+height {
+		return cursor - height + 1
+	}
+	return offset
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func fitLine(width int, s string) string {
+	if width <= 0 {
+		return s
+	}
+	return lipgloss.NewStyle().Width(width).Render(s)
+}
+
+func (m *model) refreshCmd() tea.Cmd {
+	return func() tea.Msg {
+		m.logger.Debug("refreshing inventory", slog.String("config", m.cli.ConfigPath), slog.Any("contexts", m.cli.Contexts))
+		clusters, err := argocd.LoadClustersFromFile(m.cli.ConfigPath)
+		if err != nil {
+			return refreshDoneMsg{err: err}
+		}
+		clusters = filterClusters(clusters, m.cli.Contexts)
+		if len(clusters) == 0 {
+			return refreshDoneMsg{err: fmt.Errorf("no contexts selected")}
+		}
+		start := time.Now()
+		inv, errs, err := m.discover.DiscoverInventory(m.rootCtx, clusters)
+		if err != nil {
+			return refreshDoneMsg{err: err, errs: errs}
+		}
+		m.logger.Debug("refresh inventory done", slog.Duration("took", time.Since(start)), slog.Int("clusters", len(clusters)), slog.Int("apps", len(inv)), slog.Int("cluster_errors", len(errs)))
+		return refreshDoneMsg{clusters: clusters, inv: inv, errs: errs}
+	}
+}
+
+func filterClusters(clusters []models.Cluster, allow []string) []models.Cluster {
+	if len(allow) == 0 {
+		return clusters
+	}
+	allowed := map[string]struct{}{}
+	for _, c := range allow {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		allowed[c] = struct{}{}
+	}
+	out := make([]models.Cluster, 0, len(clusters))
+	for _, cl := range clusters {
+		if _, ok := allowed[cl.ContextName]; ok {
+			out = append(out, cl)
+		}
+	}
+	return out
+}
+
+func indexOfAppKey(keys []models.AppKey, k models.AppKey) int {
+	for i := range keys {
+		if keys[i] == k {
+			return i
+		}
+	}
+	return -1
+}
