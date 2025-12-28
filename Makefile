@@ -1,4 +1,4 @@
-.PHONY: all build build-local build-docker test clean crossbuild
+.PHONY: all build build-local build-docker clean crossbuild
 
 PKG_PREFIX := github.com/iamhalje/argo-sync
 
@@ -8,12 +8,10 @@ GO  ?= go
 DOCKER ?= docker
 OUTDIR ?= ./bin
 
-VERSION ?= unknown
+VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || git describe --tags --always --dirty 2>/dev/null || echo unknown)
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 REPO ?= $(shell git config --get remote.origin.url 2>/dev/null || echo $(PKG_PREFIX))
-
-VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
 LDFLAGS ?= -s -w \
 	-X '$(PKG_PREFIX)/internal/buildinfo.Version=$(VERSION)' \
