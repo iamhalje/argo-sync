@@ -1,28 +1,6 @@
 module github.com/iamhalje/argo-sync
 
-go 1.25.0
-
-// Argo CD pulls k8s.io/kubernetes transitively, which is not designed as a
-// consumer module (it uses local "staging/" replaces internally). Without
-// explicit replaces, consumers may see "unknown revision v0.0.0" errors for
-// Kubernetes staging modules. We pin them to the matching published versions.
-replace (
-	k8s.io/cloud-provider => k8s.io/cloud-provider v0.31.2
-	k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.31.2
-	k8s.io/controller-manager => k8s.io/controller-manager v0.31.2
-	k8s.io/cri-api => k8s.io/cri-api v0.31.2
-	k8s.io/cri-client => k8s.io/cri-client v0.31.2
-	k8s.io/csi-translation-lib => k8s.io/csi-translation-lib v0.31.2
-	k8s.io/dynamic-resource-allocation => k8s.io/dynamic-resource-allocation v0.31.2
-	k8s.io/endpointslice => k8s.io/endpointslice v0.31.2
-	k8s.io/kube-controller-manager => k8s.io/kube-controller-manager v0.31.2
-	k8s.io/kube-proxy => k8s.io/kube-proxy v0.31.2
-	k8s.io/kube-scheduler => k8s.io/kube-scheduler v0.31.2
-	k8s.io/kubelet => k8s.io/kubelet v0.31.2
-	k8s.io/mount-utils => k8s.io/mount-utils v0.31.2
-	k8s.io/pod-security-admission => k8s.io/pod-security-admission v0.31.2
-	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.31.2
-)
+go 1.25.5
 
 require (
 	github.com/argoproj/argo-cd/v2 v2.14.21
@@ -77,7 +55,7 @@ require (
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
 	github.com/go-git/go-billy/v5 v5.6.2 // indirect
 	github.com/go-git/go-git/v5 v5.13.2 // indirect
-	github.com/go-jose/go-jose/v4 v4.0.2 // indirect
+	github.com/go-jose/go-jose/v4 v4.0.5 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
@@ -164,15 +142,15 @@ require (
 	go.starlark.net v0.0.0-20230525235612-a134d8f9ddca // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.3 // indirect
-	golang.org/x/crypto v0.37.0 // indirect
-	golang.org/x/mod v0.22.0 // indirect
-	golang.org/x/net v0.39.0 // indirect
-	golang.org/x/oauth2 v0.24.0 // indirect
-	golang.org/x/sys v0.36.0 // indirect
-	golang.org/x/term v0.31.0 // indirect
-	golang.org/x/text v0.24.0 // indirect
+	golang.org/x/crypto v0.45.0 // indirect
+	golang.org/x/mod v0.29.0 // indirect
+	golang.org/x/net v0.47.0 // indirect
+	golang.org/x/oauth2 v0.27.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/term v0.37.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
 	golang.org/x/time v0.8.0 // indirect
-	golang.org/x/tools v0.27.0 // indirect
+	golang.org/x/tools v0.38.0 // indirect
 	google.golang.org/genproto v0.0.0-20240213162025-012b6fc9bca9 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20241104194629-dd2ea8efbc28 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20241104194629-dd2ea8efbc28 // indirect
@@ -195,7 +173,7 @@ require (
 	k8s.io/kube-aggregator v0.31.2 // indirect
 	k8s.io/kube-openapi v0.0.0-20240228011516-70dd3763d340 // indirect
 	k8s.io/kubectl v0.31.2 // indirect
-	k8s.io/kubernetes v1.31.0 // indirect
+	k8s.io/kubernetes v1.31.6 // indirect
 	k8s.io/utils v0.0.0-20240711033017-18e509b52bc8 // indirect
 	oras.land/oras-go/v2 v2.5.0 // indirect
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect
