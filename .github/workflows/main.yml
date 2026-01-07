@@ -1,0 +1,50 @@
+name: main
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**.go'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '**.go'
+
+permissions:
+  contents: read
+
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        id: go
+        uses: actions/setup-go@v6
+        with:
+          cache: false
+          go-version: stable
+
+      - name: Cache Go artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/bin
+            ~/go/pkg/mod
+          key: go-artifacts-${{ runner.os }}-check-all-${{ steps.go.outputs.go-version }}
+          restore-keys: go-artifacts-${{ runner.os }}-check-all-
+
+      - name: Run check-all
+        run: |
+          make check-all
+          git diff --exit-code
