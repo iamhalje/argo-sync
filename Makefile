@@ -104,3 +104,30 @@ build-windows-goarch:
 
 clean:
 	rm -f "$(CURDIR)/$(BIN)"
+
+golangci-lint: install-golangci-lint
+	GOEXPERIMENT=synctest golangci-lint run
+
+install-golangci-lint:
+	which golangci-lint || curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(shell go env GOPATH)/bin v2.7.2
+
+remove-golangci-lint:
+	rm -rf `which golangci-lint`
+
+govulncheck: install-govulncheck
+	govulncheck -show verbose ./...
+
+install-govulncheck:
+	which govulncheck || go install golang.org/x/vuln/cmd/govulncheck@latest
+
+remove-govulncheck:
+	rm -rf `which govulncheck`
+
+fmt:
+	gofmt -l -w -s ./internal
+	gofmt -l -w -s ./cmd
+
+tests:
+	GO111MODULE=on go test -race -mod=mod ./...
+
+check-all: tests fmt golangci-lint
