@@ -23,6 +23,11 @@ type Cluster struct {
 	AuthToken       string
 	GRPCWeb         bool
 	GRPCWebRootPath string
+
+	// ServerVersion is discovered via the version service (best-effort).
+	ServerVersion string
+	// ServerMajor is parsed from ServerVersion (best-effort).
+	ServerMajor int
 }
 
 // AppKey is cross-cluster identifier used for grouping.

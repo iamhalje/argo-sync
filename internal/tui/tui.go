@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/sync/errgroup"
 )
 
 type Options struct {
@@ -98,6 +99,9 @@ type model struct {
 	runStartedAt  time.Time
 	runFinishedAt time.Time
 
+	beforeState map[models.Target]models.Application
+	afterState  map[models.Target]models.Application
+
 	cli Options
 }
 
@@ -123,6 +127,8 @@ func newModel(ctx context.Context, logger *slog.Logger, api argocd.API, opts Opt
 		statuses:    map[models.Target]models.TaskStatus{},
 		messages:    map[models.Target]string{},
 		errors:      map[models.Target]error{},
+		beforeState: map[models.Target]models.Application{},
+		afterState:  map[models.Target]models.Application{},
 		action:      models.ActionSync,
 		runOpts: models.RunOptions{
 			Wait:         !opts.NoWait,
@@ -171,6 +177,30 @@ func (m *model) loadCmd() tea.Cmd {
 		if len(clusters) == 0 {
 			return loadDoneMsg{err: fmt.Errorf("no contexts selected")}
 		}
+
+		// Best-effort: detect server versions to enable version-specific capabilities without flags.
+		{
+			g, vctx := errgroup.WithContext(m.rootCtx)
+			g.SetLimit(10)
+			for i := range clusters {
+				i := i
+				g.Go(func() error {
+					ctx, cancel := context.WithTimeout(vctx, 5*time.Second)
+					defer cancel()
+					ver, err := argocd.DetectServerVersion(ctx, clusters[i])
+					if err != nil {
+						m.logger.Debug("version detection failed", slog.String("context", clusters[i].ContextName), slog.Any("err", err))
+						return nil
+					}
+					clusters[i].ServerVersion = ver.Raw
+					clusters[i].ServerMajor = ver.Major
+					m.logger.Debug("server version detected", slog.String("context", clusters[i].ContextName), slog.String("version", ver.Raw), slog.Int("major", ver.Major))
+					return nil
+				})
+			}
+			_ = g.Wait()
+		}
+
 		m.logger.Debug("clusters loaded", slog.Int("count", len(clusters)))
 		start := time.Now()
 		inv, errs, err := m.discover.DiscoverInventory(m.rootCtx, clusters)
@@ -271,6 +301,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statuses[ev.Target] = ev.Phase
 		if ev.Message != "" {
 			m.messages[ev.Target] = ev.Message
+			// Best-effort: parse "operation=... sync=... health=..." messages and store as after-state snapshot.
+			if op, sync, health, ok := parseSyncWaitMessage(ev.Message); ok {
+				m.afterState[ev.Target] = models.Application{OperationPhase: op, SyncStatus: sync, HealthStatus: health}
+			}
 		}
 		if ev.Err != nil {
 			m.errors[ev.Target] = ev.Err
@@ -634,6 +668,8 @@ func (m *model) startRun() (tea.Model, tea.Cmd) {
 	m.statuses = map[models.Target]models.TaskStatus{}
 	m.messages = map[models.Target]string{}
 	m.errors = map[models.Target]error{}
+	m.beforeState = map[models.Target]models.Application{}
+	m.afterState = map[models.Target]models.Application{}
 	m.results = nil
 	m.eventsCh = make(chan models.ProgressEvent, 256)
 	m.doneCh = make(chan runDoneMsg, 1)
@@ -649,6 +685,9 @@ func (m *model) startRun() (tea.Model, tea.Cmd) {
 	m.runFinishedAt = time.Time{}
 	for _, t := range m.runTargets {
 		m.statuses[t] = models.TaskPending
+		if a, ok := m.inv[t.App][t.ClusterContext]; ok {
+			m.beforeState[t] = a
+		}
 	}
 
 	m.logger.Debug("starting bulk run", slog.String("action", string(action)), slog.Int("selected_apps", len(apps)), slog.Int("selected_clusters", len(clusters)), slog.Bool("wait", opts.Wait), slog.Bool("wait_healthy", opts.WaitHealthy), slog.Duration("wait_timeout", opts.WaitTimeout), slog.Duration("poll_interval", opts.PollInterval), slog.Bool("prune", opts.Prune), slog.Bool("dry_run", opts.DryRun), slog.Bool("apply_only", opts.ApplyOnly), slog.Bool("force", opts.Force), slog.Int("parallel", m.cli.Parallel))
@@ -1066,6 +1105,52 @@ func (m *model) viewDone(s uiStyles) string {
 	b.WriteString(fmt.Sprintf("%s %d\n", s.warn.Render("cancelled:"), cancelled))
 	b.WriteString(fmt.Sprintf("%s %d\n", s.dim.Render("pending:"), pending))
 
+	// Lightweight diff: show before/after sync+health for targets where we observed "after" status.
+	changed := 0
+	for _, t := range m.runTargets {
+		after, ok := m.afterState[t]
+		if !ok {
+			continue
+		}
+		before := m.beforeState[t]
+		if strings.TrimSpace(before.SyncStatus) != strings.TrimSpace(after.SyncStatus) || strings.TrimSpace(before.HealthStatus) != strings.TrimSpace(after.HealthStatus) {
+			changed++
+		}
+	}
+	if changed > 0 {
+		b.WriteString("\n")
+		b.WriteString(s.dim.Render(fmt.Sprintf("Status changes observed (from wait loop): %d", changed)))
+		b.WriteString("\n")
+		shown := 0
+		for _, t := range m.runTargets {
+			if shown >= 10 {
+				break
+			}
+			after, ok := m.afterState[t]
+			if !ok {
+				continue
+			}
+			before := m.beforeState[t]
+			if strings.TrimSpace(before.SyncStatus) == strings.TrimSpace(after.SyncStatus) && strings.TrimSpace(before.HealthStatus) == strings.TrimSpace(after.HealthStatus) {
+				continue
+			}
+			b.WriteString(s.dim.Render(fmt.Sprintf("- %-24s %-40s %s/%s -> %s/%s",
+				t.ClusterContext,
+				t.App.Name,
+				shortHealth(before.HealthStatus),
+				shortSync(before.SyncStatus),
+				shortHealth(after.HealthStatus),
+				shortSync(after.SyncStatus),
+			)))
+			b.WriteString("\n")
+			shown++
+		}
+		if changed > shown {
+			b.WriteString(s.dim.Render(fmt.Sprintf("…and %d more", changed-shown)))
+			b.WriteString("\n")
+		}
+	}
+
 	if failed > 0 {
 		b.WriteString("\n")
 		b.WriteString(s.error.Render("Failures:"))
@@ -1181,6 +1266,33 @@ func norm(v string) string {
 		return "Unknown"
 	}
 	return v
+}
+
+func parseSyncWaitMessage(msg string) (operation, sync, health string, ok bool) {
+	// Expected format from services/bulk.go:
+	// "operation=<op> sync=<sync> health=<health>"
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return "", "", "", false
+	}
+	parts := strings.Fields(msg)
+	if len(parts) < 3 {
+		return "", "", "", false
+	}
+	var opOK, syncOK, healthOK bool
+	for _, p := range parts {
+		if strings.HasPrefix(p, "operation=") {
+			operation = strings.TrimPrefix(p, "operation=")
+			opOK = true
+		} else if strings.HasPrefix(p, "sync=") {
+			sync = strings.TrimPrefix(p, "sync=")
+			syncOK = true
+		} else if strings.HasPrefix(p, "health=") {
+			health = strings.TrimPrefix(p, "health=")
+			healthOK = true
+		}
+	}
+	return operation, sync, health, opOK && syncOK && healthOK
 }
 
 // https://github.com/argoproj/argo-cd/blob/master/gitops-engine/pkg/health/health.go#L14

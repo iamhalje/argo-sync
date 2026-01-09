@@ -32,4 +32,4 @@ If something doesn’t work (API/auth/timeouts), run with debug logs:
 
 ## Roadmap
 
-- **Argo CD v3**: currently the project depends on `github.com/argoproj/argo-cd/v2`. Once Argo CD v3 is released/stable, the plan is to add Argo CD v3 support (likely requiring API client/model updates).
+- **Argo CD v3**: the tool uses the Argo CD gRPC API and **auto-detects server version** via `VersionService` (best-effort). The core operations used by `argo-sync` (list/get/refresh/sync) are compatible with both Argo CD v2 and v3. Future improvements can add v3-only features (e.g. server-side diff) when the server is v3+.
