@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -92,6 +93,10 @@ type model struct {
 	statuses map[models.Target]models.TaskStatus
 	messages map[models.Target]string
 	errors   map[models.Target]error
+
+	runTargets    []models.Target
+	runStartedAt  time.Time
+	runFinishedAt time.Time
 
 	cli Options
 }
@@ -276,7 +281,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case runDoneMsg:
 		m.results = msg.results
-		if msg.err != nil {
+		m.runFinishedAt = time.Now()
+		if msg.err != nil && !errors.Is(msg.err, context.Canceled) {
 			m.step = stepError
 			m.err = msg.err
 			return m, nil
@@ -634,10 +640,16 @@ func (m *model) startRun() (tea.Model, tea.Cmd) {
 
 	action := m.action
 	opts := m.runOpts
-	_ = action
 
 	apps := m.selectedApps()
 	clusters := m.selectedClusters()
+
+	m.runTargets = services.TargetsForSelection(m.inv, apps, clusters)
+	m.runStartedAt = time.Now()
+	m.runFinishedAt = time.Time{}
+	for _, t := range m.runTargets {
+		m.statuses[t] = models.TaskPending
+	}
 
 	m.logger.Debug("starting bulk run", slog.String("action", string(action)), slog.Int("selected_apps", len(apps)), slog.Int("selected_clusters", len(clusters)), slog.Bool("wait", opts.Wait), slog.Bool("wait_healthy", opts.WaitHealthy), slog.Duration("wait_timeout", opts.WaitTimeout), slog.Duration("poll_interval", opts.PollInterval), slog.Bool("prune", opts.Prune), slog.Bool("dry_run", opts.DryRun), slog.Bool("apply_only", opts.ApplyOnly), slog.Bool("force", opts.Force), slog.Int("parallel", m.cli.Parallel))
 
@@ -977,43 +989,37 @@ func (m *model) viewRunning(s uiStyles) string {
 	b.WriteString(s.hint.Render("q/esc cancels. Ctrl+C quits immediately."))
 	b.WriteString("\n\n")
 
-	apps := m.selectedApps()
-	clusters := m.selectedClusters()
-
 	total := 0
 	success := 0
 	failed := 0
+	cancelled := 0
 
-	for _, c := range clusters {
-		for _, a := range apps {
-			if _, ok := m.inv[a][c]; !ok {
-				continue
-			}
-			total++
-			t := models.Target{ClusterContext: c, App: a}
-			st := m.statuses[t]
-			switch st {
-			case models.TaskSuccess:
-				success++
-			case models.TaskFailed:
-				failed++
-			}
-
-			b.WriteString(fmt.Sprintf("%-24s %-40s %s", c, a.Name, renderStatus(s, st)))
-			if msg := m.messages[t]; msg != "" {
-				b.WriteString("\n")
-				b.WriteString(s.dim.Render("  ↳ " + truncate(msg, 120)))
-			}
-			if err := m.errors[t]; err != nil {
-				b.WriteString("\n")
-				b.WriteString(s.error.Render("  ↳ " + truncate(err.Error(), 120)))
-			}
-			b.WriteString("\n")
+	for _, t := range m.runTargets {
+		total++
+		st := m.statuses[t]
+		switch st {
+		case models.TaskSuccess:
+			success++
+		case models.TaskFailed:
+			failed++
+		case models.TaskCancelled:
+			cancelled++
 		}
+
+		b.WriteString(fmt.Sprintf("%-24s %-40s %s", t.ClusterContext, t.App.Name, renderStatus(s, st)))
+		if msg := m.messages[t]; msg != "" {
+			b.WriteString("\n")
+			b.WriteString(s.dim.Render("  ↳ " + truncate(msg, 120)))
+		}
+		if err := m.errors[t]; err != nil {
+			b.WriteString("\n")
+			b.WriteString(s.error.Render("  ↳ " + truncate(err.Error(), 120)))
+		}
+		b.WriteString("\n")
 	}
 
 	b.WriteString("\n")
-	b.WriteString(s.dim.Render(fmt.Sprintf("Total: %d  Success: %d  Failed: %d  Updated: %s", total, success, failed, time.Now().Format("15:04:05"))))
+	b.WriteString(s.dim.Render(fmt.Sprintf("Total: %d  Success: %d  Failed: %d  Cancelled: %d  Updated: %s", total, success, failed, cancelled, time.Now().Format("15:04:05"))))
 	return b.String()
 }
 
@@ -1022,19 +1028,74 @@ func (m *model) viewDone(s uiStyles) string {
 	b.WriteString(fitLine(m.width, s.header.Render("Done")))
 	b.WriteString("\n\n")
 
+	total := len(m.runTargets)
 	success := 0
 	failed := 0
-	for _, st := range m.statuses {
-		switch st {
+	cancelled := 0
+	pending := 0
+	for _, t := range m.runTargets {
+		switch m.statuses[t] {
 		case models.TaskSuccess:
 			success++
 		case models.TaskFailed:
 			failed++
+		case models.TaskCancelled:
+			cancelled++
+		default:
+			pending++
 		}
 	}
 
+	if m.action != "" {
+		b.WriteString(s.dim.Render(fmt.Sprintf("action: %s", m.action)))
+		b.WriteString("\n")
+	}
+	if !m.runStartedAt.IsZero() {
+		finish := m.runFinishedAt
+		if finish.IsZero() {
+			finish = time.Now()
+		}
+		b.WriteString(s.dim.Render(fmt.Sprintf("duration: %s", finish.Sub(m.runStartedAt).Round(time.Millisecond))))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString(fmt.Sprintf("%s %d\n", s.dim.Render("total:"), total))
 	b.WriteString(fmt.Sprintf("%s %d\n", s.ok.Render("success:"), success))
 	b.WriteString(fmt.Sprintf("%s %d\n", s.error.Render("failed:"), failed))
+	b.WriteString(fmt.Sprintf("%s %d\n", s.warn.Render("cancelled:"), cancelled))
+	b.WriteString(fmt.Sprintf("%s %d\n", s.dim.Render("pending:"), pending))
+
+	if failed > 0 {
+		b.WriteString("\n")
+		b.WriteString(s.error.Render("Failures:"))
+		b.WriteString("\n")
+		shown := 0
+		for _, t := range m.runTargets {
+			if shown >= 5 {
+				break
+			}
+			if m.statuses[t] != models.TaskFailed {
+				continue
+			}
+			err := m.errors[t]
+			msg := ""
+			if err != nil {
+				msg = err.Error()
+			}
+			if msg == "" {
+				msg = "unknown error"
+			}
+			b.WriteString(s.dim.Render(fmt.Sprintf("- %-24s %-40s %s", t.ClusterContext, t.App.Name, truncate(msg, 120))))
+			b.WriteString("\n")
+			shown++
+		}
+		if failed > shown {
+			b.WriteString(s.dim.Render(fmt.Sprintf("…and %d more", failed-shown)))
+			b.WriteString("\n")
+		}
+	}
+
 	b.WriteString("\n")
 	b.WriteString(fitLine(m.width, s.hint.Render("r restart  Enter/q to exit")))
 	return b.String()
@@ -1055,6 +1116,8 @@ func renderStatus(s uiStyles, st models.TaskStatus) string {
 		return s.ok.Render("success")
 	case models.TaskFailed:
 		return s.error.Render("failed")
+	case models.TaskCancelled:
+		return s.dim.Render("cancelled")
 	default:
 		return s.dim.Render("pending")
 	}

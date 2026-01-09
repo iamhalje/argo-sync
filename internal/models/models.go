@@ -92,6 +92,7 @@ const (
 	TaskRunning TaskStatus = "running"
 	TaskSuccess TaskStatus = "success"
 	TaskFailed  TaskStatus = "failed"
+	TaskCancelled TaskStatus = "cancelled"
 )
 
 type Target struct {
