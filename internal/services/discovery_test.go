@@ -14,6 +14,7 @@ type fakeAPI struct {
 	refreshFn func(ctx context.Context, cluster models.Cluster, app models.AppRef, hard bool) error
 	syncFn    func(ctx context.Context, cluster models.Cluster, app models.AppRef, opts models.RunOptions) error
 	getFn     func(ctx context.Context, cluster models.Cluster, app models.AppRef) (models.Application, error)
+	diffsFn   func(ctx context.Context, cluster models.Cluster, app models.AppRef, project string) ([]models.ResourceDiff, error)
 }
 
 func (f fakeAPI) ListApplications(ctx context.Context, cluster models.Cluster) ([]models.Application, error) {
@@ -42,6 +43,13 @@ func (f fakeAPI) GetApplication(ctx context.Context, cluster models.Cluster, app
 		return models.Application{}, nil
 	}
 	return f.getFn(ctx, cluster, app)
+}
+
+func (f fakeAPI) ManagedResourceDiffs(ctx context.Context, cluster models.Cluster, app models.AppRef, project string) ([]models.ResourceDiff, error) {
+	if f.diffsFn == nil {
+		return nil, nil
+	}
+	return f.diffsFn(ctx, cluster, app, project)
 }
 
 func TestDiscoveryService_DiscoverInventory_PartialFailure(t *testing.T) {

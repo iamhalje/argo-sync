@@ -14,6 +14,10 @@ Run:
 ./argo-sync
 ```
 
+Keys (TUI):
+
+- **Step 1 (apps)**: `d` opens diff view for the highlighted app (select cluster → resources → patch/details).
+
 Useful flags:
 
 - **`--config`**: path to Argo CD config (default: `~/.config/argocd/config`)
