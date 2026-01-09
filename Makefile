@@ -7,6 +7,9 @@ PKG ?= ./cmd/argo-sync
 GO  ?= go
 DOCKER ?= docker
 OUTDIR ?= ./bin
+GOBIN ?= $(shell $(GO) env GOPATH)/bin
+GOLANGCI_LINT ?= $(GOBIN)/golangci-lint
+GOVULNCHECK ?= $(GOBIN)/govulncheck
 
 VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || git describe --tags --always --dirty 2>/dev/null || echo unknown)
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -106,22 +109,22 @@ clean:
 	rm -f "$(CURDIR)/$(BIN)"
 
 golangci-lint: install-golangci-lint
-	GOEXPERIMENT=synctest golangci-lint run
+	$(GOLANGCI_LINT) run
 
 install-golangci-lint:
-	which golangci-lint || curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(shell go env GOPATH)/bin v2.7.2
+	test -x "$(GOLANGCI_LINT)" || curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b "$(GOBIN)" v2.7.2
 
 remove-golangci-lint:
-	rm -rf `which golangci-lint`
+	rm -f "$(GOLANGCI_LINT)"
 
 govulncheck: install-govulncheck
-	govulncheck -show verbose ./...
+	"$(GOVULNCHECK)" -show verbose ./...
 
 install-govulncheck:
-	which govulncheck || go install golang.org/x/vuln/cmd/govulncheck@latest
+	test -x "$(GOVULNCHECK)" || GOBIN="$(GOBIN)" $(GO) install golang.org/x/vuln/cmd/govulncheck@latest
 
 remove-govulncheck:
-	rm -rf `which govulncheck`
+	rm -f "$(GOVULNCHECK)"
 
 fmt:
 	gofmt -l -w -s ./internal
