@@ -59,6 +59,25 @@ type Application struct {
 	OperationMessage string
 }
 
+// ResourceDiff is a simplified view of Argo CD resource diff.
+// It is derived from Argo CD's v1alpha1.ResourceDiff.
+type ResourceDiff struct {
+	Group     string
+	Kind      string
+	Namespace string
+	Name      string
+
+	Modified bool
+
+	// Diff is the JSON patch between target and live (may be empty).
+	Diff string
+
+	// NormalizedLiveState is JSON serialized live state after normalizations (may be empty).
+	NormalizedLiveState string
+	// PredictedLiveState is JSON serialized predicted live state (may be empty).
+	PredictedLiveState string
+}
+
 // Inventory contains all discovered apps grouped by AppKey.
 type Inventory map[AppKey]map[string]Application
 
