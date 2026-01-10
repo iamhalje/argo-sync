@@ -6,11 +6,21 @@ on:
       - main
     paths:
       - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'Dockerfile'
+      - '.github/workflows/**'
   pull_request:
     branches:
       - main
     paths:
       - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'Dockerfile'
+      - '.github/workflows/**'
 
 permissions:
   contents: read
