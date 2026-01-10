@@ -88,10 +88,11 @@ type RunOptions struct {
 type TaskStatus string
 
 const (
-	TaskPending TaskStatus = "pending"
-	TaskRunning TaskStatus = "running"
-	TaskSuccess TaskStatus = "success"
-	TaskFailed  TaskStatus = "failed"
+	TaskPending   TaskStatus = "pending"
+	TaskRunning   TaskStatus = "running"
+	TaskSuccess   TaskStatus = "success"
+	TaskFailed    TaskStatus = "failed"
+	TaskCancelled TaskStatus = "cancelled"
 )
 
 type Target struct {
