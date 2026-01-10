@@ -884,8 +884,17 @@ func (m *model) viewSelectApps(s uiStyles) string {
 		sort.Strings(clusters)
 		for _, c := range clusters {
 			a := m.inv[k][c]
-			b.WriteString(fmt.Sprintf("  %-24s %s  %s\n",
+			verLabel := "version=unknown"
+			if cl, ok := m.clusterBy[c]; ok {
+				if v := strings.TrimSpace(cl.ServerVersion); v != "" {
+					verLabel = "version=" + v
+				} else if cl.ServerMajor > 0 {
+					verLabel = fmt.Sprintf("version=v%d.x", cl.ServerMajor)
+				}
+			}
+			b.WriteString(fmt.Sprintf("  %-24s %-18s %s  %s\n",
 				c,
+				s.dim.Render(verLabel),
 				renderAppHealth(s, a.HealthStatus),
 				renderAppSync(s, a.SyncStatus),
 			))
@@ -912,7 +921,15 @@ func (m *model) viewSelectClusters(s uiStyles) string {
 		if m.clSelected[c] {
 			check = "[x]"
 		}
-		b.WriteString(fmt.Sprintf("%s %s %s\n", cursor, check, c))
+		verLabel := "version=unknown"
+		if cl, ok := m.clusterBy[c]; ok {
+			if v := strings.TrimSpace(cl.ServerVersion); v != "" {
+				verLabel = "version=" + v
+			} else if cl.ServerMajor > 0 {
+				verLabel = fmt.Sprintf("version=v%d.x", cl.ServerMajor)
+			}
+		}
+		b.WriteString(fmt.Sprintf("%s %s %-28s %s\n", cursor, check, c, s.dim.Render(verLabel)))
 	}
 	if len(m.clusterNames) > 0 {
 		b.WriteString(s.dim.Render(fmt.Sprintf("Showing %d–%d of %d", start+1, end, len(m.clusterNames))))
