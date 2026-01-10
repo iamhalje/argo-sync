@@ -12,6 +12,7 @@ import (
 	"github.com/iamhalje/argo-sync/internal/argocd"
 	"github.com/iamhalje/argo-sync/internal/models"
 	"github.com/iamhalje/argo-sync/internal/services"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -1401,6 +1402,28 @@ func (m *model) refreshCmd() tea.Cmd {
 		clusters = filterClusters(clusters, m.cli.Contexts)
 		if len(clusters) == 0 {
 			return refreshDoneMsg{err: fmt.Errorf("no contexts selected")}
+		}
+		// detection argocd version to enable version specific (server side diff)
+		{
+			g, vctx := errgroup.WithContext(m.rootCtx)
+			g.SetLimit(10)
+			for i := range clusters {
+				i := i
+				g.Go(func() error {
+					ctx, cancel := context.WithTimeout(vctx, 5*time.Second)
+					defer cancel()
+					ver, err := argocd.DetectServerVersion(ctx, clusters[i])
+					if err != nil {
+						m.logger.Debug("version detection failed", slog.String("context", clusters[i].ContextName), slog.Any("err", err))
+						return nil
+					}
+					clusters[i].ServerVersion = ver.Raw
+					clusters[i].ServerMajor = ver.Major
+					m.logger.Debug("server version detected", slog.String("context", clusters[i].ContextName), slog.String("version", ver.Raw), slog.Int("major", ver.Major))
+					return nil
+				})
+			}
+			_ = g.Wait()
 		}
 		start := time.Now()
 		inv, errs, err := m.discover.DiscoverInventory(m.rootCtx, clusters)
