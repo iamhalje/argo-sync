@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/iamhalje/argo-sync/internal/argocd"
@@ -96,7 +97,12 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 				emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskRunning, Action: action, Message: "submitted sync request"})
 				err = s.api.SyncApplication(ctx, cl, ref, opts)
 				if err != nil {
-					break
+					// ah shit, sync already in progress
+					if opts.Wait && IsOpInProgressErr(err) {
+						emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskRunning, Action: action, Message: "sync already in progress"})
+					} else {
+						break
+					}
 				}
 				if opts.Wait {
 					if e := s.waitForHealthy(ctx, cl, t, ref, opts, emit); e != nil {
@@ -110,10 +116,13 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 			if err != nil {
 				// treat cancellation/timeouts as cancelled
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskFailed, Action: action, Err: err})
-					resCh <- models.Result{Target: t, Action: action, Status: models.TaskFailed, Err: err}
+					emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskCancelled, Action: action, Err: err})
+					resCh <- models.Result{Target: t, Action: action, Status: models.TaskCancelled, Err: err}
 					return nil
 				}
+				emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskFailed, Action: action, Err: err})
+				resCh <- models.Result{Target: t, Action: action, Status: models.TaskFailed, Err: err}
+				return nil
 			}
 
 			emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskSuccess, Action: action})
@@ -137,6 +146,17 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 	})
 
 	return results, err
+}
+
+func IsOpInProgressErr(err error) bool {
+	// argocd returns:
+	// "rpc error: code = failedPrecondition desc = another operation is already in progress"
+	if err == nil {
+		return false
+	}
+
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "another operation is already in progress") || strings.Contains("")
 }
 
 func (s *BulkService) waitForHealthy(ctx context.Context, cluster models.Cluster, target models.Target, app models.AppRef, opts models.RunOptions, emit func(models.ProgressEvent)) error {
