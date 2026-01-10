@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/iamhalje/argo-sync/internal/argocd"
@@ -26,15 +27,7 @@ func NewBulkService(api argocd.API, parallel int) *BulkService {
 
 // Run executes action for all (cluster, app) targets that exist in inventory.
 func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByContext map[string]models.Cluster, selectedApps []models.AppKey, selectedClusters []string, action models.Action, opts models.RunOptions, events chan<- models.ProgressEvent) ([]models.Result, error) {
-	targets := make([]models.Target, 0, len(selectedApps)*len(selectedClusters))
-	for _, c := range selectedClusters {
-		for _, a := range selectedApps {
-			if _, ok := inv[a][c]; !ok {
-				continue
-			}
-			targets = append(targets, models.Target{ClusterContext: c, App: a})
-		}
-	}
+	targets := TargetsForSelection(inv, selectedApps, selectedClusters)
 	if len(targets) == 0 {
 		return nil, errors.New("no runnable targets")
 	}
@@ -58,6 +51,16 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 	for _, t := range targets {
 		t := t
 		g.Go(func() error {
+			// if the run was cancelled before starting this target, repot it as cancelled
+			select {
+			case <-ctx.Done():
+				err := ctx.Err()
+				emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskCancelled, Action: action, Err: err})
+				resCh <- models.Result{Target: t, Action: action, Status: models.TaskCancelled, Err: err}
+				return err
+			default:
+			}
+
 			cl, ok := clustersByContext[t.ClusterContext]
 			if !ok {
 				err := fmt.Errorf("unknown cluster context %q", t.ClusterContext)
@@ -105,9 +108,12 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 			}
 
 			if err != nil {
-				emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskFailed, Action: action, Err: err})
-				resCh <- models.Result{Target: t, Action: action, Status: models.TaskFailed, Err: err}
-				return nil
+				// treat cancellation/timeouts as cancelled
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskFailed, Action: action, Err: err})
+					resCh <- models.Result{Target: t, Action: action, Status: models.TaskFailed, Err: err}
+					return nil
+				}
 			}
 
 			emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskSuccess, Action: action})
@@ -116,13 +122,21 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 		})
 	}
 
-	_ = g.Wait()
+	err := g.Wait()
 	close(resCh)
 
 	for r := range resCh {
 		results = append(results, r)
 	}
-	return results, nil
+
+	slices.SortFunc(results, func(a, b models.Result) int {
+		if a.Target.ClusterContext != b.Target.ClusterContext {
+			return cmp(a.Target.ClusterContext, b.Target.ClusterContext)
+		}
+		return cmp(a.Target.App.Name, b.Target.App.Name)
+	})
+
+	return results, err
 }
 
 func (s *BulkService) waitForHealthy(ctx context.Context, cluster models.Cluster, target models.Target, app models.AppRef, opts models.RunOptions, emit func(models.ProgressEvent)) error {
@@ -185,4 +199,14 @@ func normEmpty(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func cmp(a, b string) int {
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
 }
