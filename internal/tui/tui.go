@@ -178,6 +178,31 @@ func (m *model) loadCmd() tea.Cmd {
 			return loadDoneMsg{err: fmt.Errorf("no contexts selected")}
 		}
 		m.logger.Debug("clusters loaded", slog.Int("count", len(clusters)))
+
+		// Detect Argo CD version per cluster (best-effort) so the UI can show it and
+		// we can enable version-specific behavior in the future.
+		{
+			g, vctx := errgroup.WithContext(m.rootCtx)
+			g.SetLimit(10)
+			for i := range clusters {
+				i := i
+				g.Go(func() error {
+					ctx, cancel := context.WithTimeout(vctx, 5*time.Second)
+					defer cancel()
+					ver, err := argocd.DetectServerVersion(ctx, clusters[i])
+					if err != nil {
+						m.logger.Debug("version detection failed", slog.String("context", clusters[i].ContextName), slog.Any("err", err))
+						return nil
+					}
+					clusters[i].ServerVersion = ver.Raw
+					clusters[i].ServerMajor = ver.Major
+					m.logger.Debug("server version detected", slog.String("context", clusters[i].ContextName), slog.String("version", ver.Raw), slog.Int("major", ver.Major))
+					return nil
+				})
+			}
+			_ = g.Wait()
+		}
+
 		start := time.Now()
 		inv, errs, err := m.discover.DiscoverInventory(m.rootCtx, clusters)
 		if err != nil {
