@@ -21,7 +21,7 @@ type ServerVersion struct {
 }
 
 type versionHTTPResponse struct {
-	Version string `json:"Version`
+	Version string `json:"Version"`
 }
 
 func DetectServerVersion(ctx context.Context, cluster models.Cluster) (ServerVersion, error) {
