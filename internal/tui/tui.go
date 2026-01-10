@@ -321,6 +321,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
+		// Update cached inventory for the targets we just operated on.
+		// This lets Step 1/3 show fresher statuses without requiring a full refresh.
+		m.applyAfterStateToInventory()
 		m.step = stepDone
 		return m, nil
 	default:
@@ -1295,6 +1298,33 @@ func (m *model) resetToStart() {
 	m.statuses = map[models.Target]models.TaskStatus{}
 	m.errors = map[models.Target]error{}
 	m.results = nil
+}
+
+func (m *model) applyAfterStateToInventory() {
+	if len(m.afterState) == 0 {
+		return
+	}
+	for t, st := range m.afterState {
+		byCluster, ok := m.inv[t.App]
+		if !ok {
+			continue
+		}
+		app, ok := byCluster[t.ClusterContext]
+		if !ok {
+			continue
+		}
+		// Avoid clobbering with placeholder values.
+		if v := strings.TrimSpace(st.SyncStatus); v != "" && v != "Unknown" {
+			app.SyncStatus = v
+		}
+		if v := strings.TrimSpace(st.HealthStatus); v != "" && v != "Unknown" {
+			app.HealthStatus = v
+		}
+		if v := strings.TrimSpace(st.OperationPhase); v != "" && v != "Unknown" {
+			app.OperationPhase = v
+		}
+		byCluster[t.ClusterContext] = app
+	}
 }
 
 func (m *model) ensureVisible() {
