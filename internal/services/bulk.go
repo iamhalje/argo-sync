@@ -156,7 +156,7 @@ func IsOpInProgressErr(err error) bool {
 	}
 
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "another operation is already in progress") || strings.Contains("")
+	return strings.Contains(s, "operation is already in progress")
 }
 
 func (s *BulkService) waitForHealthy(ctx context.Context, cluster models.Cluster, target models.Target, app models.AppRef, opts models.RunOptions, emit func(models.ProgressEvent)) error {
