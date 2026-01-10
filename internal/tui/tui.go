@@ -178,6 +178,27 @@ func (m *model) loadCmd() tea.Cmd {
 			return loadDoneMsg{err: fmt.Errorf("no contexts selected")}
 		}
 		m.logger.Debug("clusters loaded", slog.Int("count", len(clusters)))
+		{
+			g, vctx := errgroup.WithContext(m.rootCtx)
+			g.SetLimit(10)
+			for i := range clusters {
+				i := i
+				g.Go(func() error {
+					ctx, cancel := context.WithTimeout(vctx, 5*time.Second)
+					defer cancel()
+					ver, err := argocd.DetectServerVersion(ctx, clusters[i])
+					if err != nil {
+						m.logger.Debug("version detection failed", slog.String("context", clusters[i].ContextName), slog.Any("err", err))
+						return nil
+					}
+					clusters[i].ServerVersion = ver.Raw
+					clusters[i].ServerMajor = ver.Major
+					m.logger.Debug("server version detected", slog.String("context", clusters[i].ContextName), slog.String("version", ver.Raw), slog.Int("major", ver.Major))
+					return nil
+				})
+			}
+			_ = g.Wait()
+		}
 		start := time.Now()
 		inv, errs, err := m.discover.DiscoverInventory(m.rootCtx, clusters)
 		if err != nil {
@@ -884,8 +905,17 @@ func (m *model) viewSelectApps(s uiStyles) string {
 		sort.Strings(clusters)
 		for _, c := range clusters {
 			a := m.inv[k][c]
-			b.WriteString(fmt.Sprintf("  %-24s %s  %s\n",
+			verLabel := "version=unknown"
+			if cl, ok := m.clusterBy[c]; ok {
+				if v := strings.TrimSpace(cl.ServerVersion); v != "" {
+					verLabel = "version=" + v
+				} else if cl.ServerMajor > 0 {
+					verLabel = fmt.Sprintf("version=v%d.x", cl.ServerMajor)
+				}
+			}
+			b.WriteString(fmt.Sprintf("  %-24s %-18s %s  %s\n",
 				c,
+				s.dim.Render(verLabel),
 				renderAppHealth(s, a.HealthStatus),
 				renderAppSync(s, a.SyncStatus),
 			))
@@ -912,7 +942,15 @@ func (m *model) viewSelectClusters(s uiStyles) string {
 		if m.clSelected[c] {
 			check = "[x]"
 		}
-		b.WriteString(fmt.Sprintf("%s %s %s\n", cursor, check, c))
+		verLabel := "version=unknown"
+		if cl, ok := m.clusterBy[c]; ok {
+			if v := strings.TrimSpace(cl.ServerVersion); v != "" {
+				verLabel = "version=" + v
+			} else if cl.ServerMajor > 0 {
+				verLabel = fmt.Sprintf("version=v%d.x", cl.ServerMajor)
+			}
+		}
+		b.WriteString(fmt.Sprintf("%s %s %-28s %s\n", cursor, check, c, s.dim.Render(verLabel)))
 	}
 	if len(m.clusterNames) > 0 {
 		b.WriteString(s.dim.Render(fmt.Sprintf("Showing %d–%d of %d", start+1, end, len(m.clusterNames))))

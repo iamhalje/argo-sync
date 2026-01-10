@@ -29,7 +29,3 @@ If something doesn’t work (API/auth/timeouts), run with debug logs:
 ```bash
 ./argo-sync --debug --log-file ./argo-sync.json
 ```
-
-## Roadmap
-
-- **Argo CD v3**: currently the project depends on `github.com/argoproj/argo-cd/v2`. Once Argo CD v3 is released/stable, the plan is to add Argo CD v3 support (likely requiring API client/model updates).
