@@ -1044,17 +1044,8 @@ func (m *model) viewSelectApps(s uiStyles) string {
 		sort.Strings(clusters)
 		for _, c := range clusters {
 			a := m.inv[k][c]
-			verLabel := "version=unknown"
-			if cl, ok := m.clusterBy[c]; ok {
-				if v := strings.TrimSpace(cl.ServerVersion); v != "" {
-					verLabel = "version=" + v
-				} else if cl.ServerMajor > 0 {
-					verLabel = fmt.Sprintf("version=v%d.x", cl.ServerMajor)
-				}
-			}
-			b.WriteString(fmt.Sprintf("  %-24s %-18s %s  %s\n",
+			b.WriteString(fmt.Sprintf("  %-24s %s  %s\n",
 				c,
-				s.dim.Render(verLabel),
 				renderAppHealth(s, a.HealthStatus),
 				renderAppSync(s, a.SyncStatus),
 			))
