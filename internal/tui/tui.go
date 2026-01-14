@@ -42,8 +42,8 @@ type step int
 const (
 	stepLoading step = iota
 	stepSelectApps
-	stepSelectResources
 	stepSelectClusters
+	stepSelectResources
 	stepSelectAction
 	stepConfirm
 	stepRunning
@@ -355,10 +355,10 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case stepSelectApps:
 		return m.onKeySelectApps(msg)
-	case stepSelectResources:
-		return m.onKeySelectResources(msg)
 	case stepSelectClusters:
 		return m.onKeySelectClusters(msg)
+	case stepSelectResources:
+		return m.onKeySelectResources(msg)
 	case stepSelectAction:
 		return m.onKeySelectAction(msg)
 	case stepConfirm:
@@ -487,17 +487,21 @@ func (m *model) onKeySelectApps(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(apps) == 0 {
 			return m, nil
 		}
-		// Step 2: resources (required per app). After apps selection changed;
-		// recompute clusters later.
-		m.resApps = apps
-		m.resAppIdx = 0
-		m.resList = resourcesForApp(m.inv, apps[0])
-		m.resSelectedBy = map[models.AppKey]map[models.SyncResource]bool{}
-		m.clusterNames = nil
+		cl, err := services.ClustersForApps(m.inv, apps)
+		if err != nil {
+			m.step = stepError
+			m.err = err
+			return m, nil
+		}
+		m.clusterNames = cl
 		m.clSelected = map[string]bool{}
+		// default: all
+		for _, c := range cl {
+			m.clSelected[c] = true
+		}
 		m.cursor = 0
-		m.resOffset = 0
-		m.step = stepSelectResources
+		m.clOffset = 0
+		m.step = stepSelectClusters
 		return m, nil
 	default:
 		return m, nil
@@ -510,8 +514,8 @@ func (m *model) onKeySelectResources(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "backspace":
 		m.cursor = 0
-		m.appOffset = 0
-		m.step = stepSelectApps
+		m.clOffset = 0
+		m.step = stepSelectClusters
 		return m, nil
 	case "up":
 		if m.cursor > 0 {
@@ -583,27 +587,14 @@ func (m *model) onKeySelectResources(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// advance to next app, or proceed to cluster selection
 		if m.resAppIdx < len(m.resApps)-1 {
 			m.resAppIdx++
-			m.resList = resourcesForApp(m.inv, m.resApps[m.resAppIdx])
+			m.resList = resourcesForAppInClusters(m.inv, m.resApps[m.resAppIdx], m.selectedClusters())
 			m.cursor = 0
 			m.resOffset = 0
 			m.ensureVisible()
 			return m, nil
 		}
-
-		cl, err := services.ClustersForApps(m.inv, m.resApps)
-		if err != nil {
-			m.step = stepError
-			m.err = err
-			return m, nil
-		}
-		m.clusterNames = cl
-		m.clSelected = map[string]bool{}
-		for _, c := range cl {
-			m.clSelected[c] = true
-		}
 		m.cursor = 0
-		m.clOffset = 0
-		m.step = stepSelectClusters
+		m.step = stepSelectAction
 		return m, nil
 	default:
 		return m, nil
@@ -616,8 +607,8 @@ func (m *model) onKeySelectClusters(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "backspace":
 		m.cursor = 0
-		m.resOffset = 0
-		m.step = stepSelectResources
+		m.appOffset = 0
+		m.step = stepSelectApps
 		return m, nil
 	case "up":
 		if m.cursor > 0 {
@@ -673,11 +664,23 @@ func (m *model) onKeySelectClusters(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "enter":
-		if len(m.selectedClusters()) == 0 {
+		clusters := m.selectedClusters()
+		if len(clusters) == 0 {
 			return m, nil
 		}
+
+		// Step 3: resources (required per app) based on selected clusters.
+		apps := m.selectedApps()
+		if len(apps) == 0 {
+			return m, nil
+		}
+		m.resApps = apps
+		m.resAppIdx = 0
+		m.resList = resourcesForAppInClusters(m.inv, apps[0], clusters)
+		m.resSelectedBy = map[models.AppKey]map[models.SyncResource]bool{}
 		m.cursor = 0
-		m.step = stepSelectAction
+		m.resOffset = 0
+		m.step = stepSelectResources
 		return m, nil
 	default:
 		return m, nil
@@ -691,7 +694,7 @@ func (m *model) onKeySelectAction(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "backspace":
 		m.cursor = 0
-		m.step = stepSelectClusters
+		m.step = stepSelectResources
 		return m, nil
 	case "up":
 		if m.actionIdx > 0 {
@@ -858,10 +861,10 @@ func (m *model) View() string {
 		return theme.header.Render("argo-sync") + "\n\n" + theme.error.Render(fmt.Sprintf("Error: %v", m.err)) + "\n\n" + theme.hint.Render("Enter/Esc to exit")
 	case stepSelectApps:
 		return m.viewSelectApps(theme)
-	case stepSelectResources:
-		return m.viewSelectResources(theme)
 	case stepSelectClusters:
 		return m.viewSelectClusters(theme)
+	case stepSelectResources:
+		return m.viewSelectResources(theme)
 	case stepSelectAction:
 		return m.viewSelectAction(theme)
 	case stepConfirm:
@@ -913,7 +916,7 @@ func (m *model) selectedResourcesFor(app models.AppKey) []models.SyncResource {
 	}
 
 	// keep stable ordering: based on current resource list for this app.
-	list := resourcesForApp(m.inv, app)
+	list := resourcesForAppInClusters(m.inv, app, m.selectedClusters())
 	out := make([]models.SyncResource, 0, len(mm))
 	for _, r := range list {
 		if mm[r] {
@@ -1060,9 +1063,9 @@ func (m *model) viewSelectResources(s uiStyles) string {
 	if m.resAppIdx >= 0 && m.resAppIdx < len(m.resApps) {
 		app = m.resApps[m.resAppIdx]
 	}
-	title := "Step 2/4: Select Resources"
+	title := "Step 3/4: Select Resources"
 	if app.Name != "" {
-		title = fmt.Sprintf("Step 2/4: Select Resources for %s (%d/%d)", app.Name, m.resAppIdx+1, len(m.resApps))
+		title = fmt.Sprintf("Step 3/4: Select Resources for %s (%d/%d)", app.Name, m.resAppIdx+1, len(m.resApps))
 	}
 	b.WriteString(fitLine(m.width, s.header.Render(title)))
 	b.WriteString("\n")
@@ -1100,7 +1103,7 @@ func (m *model) viewSelectResources(s uiStyles) string {
 
 func (m *model) viewSelectClusters(s uiStyles) string {
 	var b strings.Builder
-	b.WriteString(fitLine(m.width, s.header.Render("Step 3/4: Select Clusters")))
+	b.WriteString(fitLine(m.width, s.header.Render("Step 2/4: Select Clusters")))
 	b.WriteString("\n")
 	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | Backspace back | Enter next | q quit")))
 	b.WriteString("\n\n")
@@ -1574,11 +1577,20 @@ func (m *model) clustersListHeight() int {
 	return max(5, available)
 }
 
-func resourcesForApp(inv models.Inventory, appKey models.AppKey) []models.SyncResource {
+func resourcesForAppInClusters(inv models.Inventory, appKey models.AppKey, clusters []string) []models.SyncResource {
 	set := map[models.SyncResource]struct{}{}
 	perCluster, ok := inv[appKey]
 	if ok {
-		for _, app := range perCluster {
+		allowed := map[string]struct{}{}
+		for _, c := range clusters {
+			allowed[c] = struct{}{}
+		}
+		for ctx, app := range perCluster {
+			if len(allowed) > 0 {
+				if _, ok := allowed[ctx]; !ok {
+					continue
+				}
+			}
 			for _, r := range app.Resources {
 				if strings.TrimSpace(r.Kind) == "" || strings.TrimSpace(r.Name) == "" {
 					continue
