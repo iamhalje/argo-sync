@@ -42,7 +42,6 @@ type step int
 const (
 	stepLoading step = iota
 	stepSelectApps
-	stepSelectResources
 	stepSelectClusters
 	stepSelectResources
 	stepSelectAction
@@ -77,15 +76,15 @@ type model struct {
 	resOffset int
 	clOffset  int
 
-	appKeysAll   []models.AppKey
-	appKeys      []models.AppKey
-	appSelected  map[models.AppKey]bool
+	appKeysAll    []models.AppKey
+	appKeys       []models.AppKey
+	appSelected   map[models.AppKey]bool
 	resApps       []models.AppKey
 	resAppIdx     int
 	resList       []models.SyncResource
 	resSelectedBy map[models.AppKey]map[models.SyncResource]bool
-	clusterNames []string
-	clSelected   map[string]bool
+	clusterNames  []string
+	clSelected    map[string]bool
 
 	filtering  bool
 	filter     textinput.Model
@@ -121,23 +120,23 @@ func newModel(ctx context.Context, logger *slog.Logger, api argocd.API, opts Opt
 	ti.Width = 40
 	ti.Blur()
 	return &model{
-		rootCtx:     runCtx,
-		cancel:      cancel,
-		logger:      logger,
-		api:         api,
-		discover:    services.NewDiscoveryService(api),
-		bulk:        services.NewBulkService(api, opts.Parallel),
-		step:        stepLoading,
-		appSelected: map[models.AppKey]bool{},
+		rootCtx:       runCtx,
+		cancel:        cancel,
+		logger:        logger,
+		api:           api,
+		discover:      services.NewDiscoveryService(api),
+		bulk:          services.NewBulkService(api, opts.Parallel),
+		step:          stepLoading,
+		appSelected:   map[models.AppKey]bool{},
 		resSelectedBy: map[models.AppKey]map[models.SyncResource]bool{},
-		clSelected:  map[string]bool{},
-		filter:      ti,
-		statuses:    map[models.Target]models.TaskStatus{},
-		messages:    map[models.Target]string{},
-		errors:      map[models.Target]error{},
-		beforeState: map[models.Target]models.Application{},
-		afterState:  map[models.Target]models.Application{},
-		action:      models.ActionSync,
+		clSelected:    map[string]bool{},
+		filter:        ti,
+		statuses:      map[models.Target]models.TaskStatus{},
+		messages:      map[models.Target]string{},
+		errors:        map[models.Target]error{},
+		beforeState:   map[models.Target]models.Application{},
+		afterState:    map[models.Target]models.Application{},
+		action:        models.ActionSync,
 		runOpts: models.RunOptions{
 			Wait:         !opts.NoWait,
 			WaitHealthy:  !opts.NoWait,
@@ -356,8 +355,6 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case stepSelectApps:
 		return m.onKeySelectApps(msg)
-	case stepSelectResources:
-		return m.onKeySelectResources(msg)
 	case stepSelectClusters:
 		return m.onKeySelectClusters(msg)
 	case stepSelectResources:
@@ -493,7 +490,6 @@ func (m *model) onKeySelectApps(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		cl, err := services.ClustersForApps(m.inv, apps)
 		m.resApps = apps
 		m.resAppIdx = 0
-		m.ResList = resourcesForApp()
 		if err != nil {
 			m.step = stepError
 			m.err = err
@@ -1796,181 +1792,4 @@ func parseSyncWaitMessage(msg string) (operation, sync, health string, ok bool) 
 		}
 	}
 	return operation, sync, health, opOK && syncOK && healthOK
-}
-
-func (m *model) onKeySelectResources(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "q", "esc":
-		return m, tea.Quit
-	case "backspace":
-		m.cursor = 0
-		m.appOffset = 0
-		m.step = stepSelectApps
-		return m, nil
-	case "up":
-		if m.cursor > 0 {
-			m.cursor--
-		}
-		m.ensureVisible()
-		return m, nil
-	case "down":
-		if m.cursor < len(m.resList)-1 {
-			m.cursor++
-		}
-		m.ensureVisible()
-		return m, nil
-	case "pgup":
-		h := m.resourcesListHeight()
-		if h <= 0 {
-			h = 10
-		}
-		m.cursor -= h
-		if m.cursor < 0 {
-			m.cursor = 0
-		}
-		m.ensureVisible()
-		return m, nil
-	case "pgdown":
-		h := m.resourcesListHeight()
-		if h <= 0 {
-			h = 10
-		}
-		m.cursor += h
-		if m.cursor > len(m.resList)-1 {
-			m.cursor = len(m.resList) - 1
-		}
-		m.ensureVisible()
-		return m, nil
-	case " ":
-		if len(m.resList) == 0 {
-			return m, nil
-		}
-		r := m.resList[m.cursor]
-		app := m.resApps[m.resAppIdx]
-		if m.resSelectedBy[app] == nil {
-			m.resSelectedBy[app] = map[models.SyncResources]bool{}
-		}
-		m.resSelectedBy[app][r] = !m.resSelectedBy[app][r]
-		return m, nil
-	case "a":
-		all := true
-		app := m.resApps[m.resAppIdx]
-		for _, r := range m.resList {
-			if m.resSelectedBy[app] == nil || !m.resSelectedBy[app][r] {
-				all = false
-				break
-			}
-		}
-		if m.resSelectedBy[app] == nil {
-			m.resSelectedBy[app] = map[models.SyncResources]bool{}
-		}
-
-		for _, r := range m.resList {
-			m.resSelectedBy[app][r] = !all
-		}
-		return m, nil
-	case "enter":
-		app := m.resApps[m.resAppIdx]
-		if len(m.selectedResourcesFor(app)) == 0 {
-			// resources are required for each selected app
-			return m, nil
-		}
-		// advance to next app, or proceed to cluster selection
-		if m.resAppIdx < len(m.resApps)-1 {
-			m.resAppIdx++
-			m.resList = resourcesForApp(m.inv, m.resApps[m.resAppIdx])
-			m.cursor = 0
-			m.resOffset = 0
-			m.ensureVisible()
-			return m, nil
-		}
-		cl, err := services.ClustersForApps(m.inv, m.resApps)
-		if err != nil {
-			m.step = stepError
-			m.err = err
-			return m, nil
-		}
-		m.clusterNames = cl
-		m.clSelected = map[string]bool{}
-		for _, c := range cl {
-			m.clSelected[c] = true
-		}
-		m.cursor = 0
-		m.clOffset = 0
-		m.step = stepSelectClusters
-		return m, nil
-	default:
-		return m, nil
-	}
-}
-
-func formatSyncResource(r models.SyncResources) string {
-	g := strings.TrimSpace(r.Group)
-	if g == "" {
-		g = "core"
-	}
-	ns := strings.TrimSpace(r.Namespace)
-	if ns == "" {
-		ns = "-"
-	}
-	return fmt.Sprintf("%s/%s %s/%s", g, r.Kind, ns, r.Name)
-}
-
-func resourcesForApp(inv models.Inventory, appKey models.AppKey) []models.SyncResources {
-	set := map[models.SyncResources]struct{}{}
-	perCluster, ok := inv[appKey]
-	if ok {
-		for _, app := range perCluster {
-			for _, r := range app.Resources {
-				if strings.TrimSpace(r.Kind) == "" || strings.TrimSpace(r.Name) == "" {
-					continue
-				}
-				set[r] = struct{}{}
-			}
-		}
-	}
-
-	out := make([]models.SyncResources, 0, len(set))
-	for r := range set {
-		out = append(out, r)
-	}
-
-	sort.Slice(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		if a.Group != b.Group {
-			return a.Group < b.Group
-		}
-
-		if a.Kind != b.Kind {
-			return a.Kind < b.Kind
-		}
-
-		if a.Namespace != b.Namespace {
-			return a.Namespace < b.Namespace
-		}
-		return a.Name < b.Name
-	})
-	return out
-}
-
-func (m *model) resourcesListHeight() int {
-	if m.height <= 0 {
-		return 20
-	}
-	header := 5
-	footer := 1
-	available := m.height - header - footer - 1
-	return max(5, available)
-}
-
-func (m *model) resourcesVisibleRange() (start, end int) {
-	h := m.resourcesListHeight()
-	if h <= 0 {
-		h = 20
-	}
-
-	start = clamp(m.resOffset, 0, max(0, len(m.resList)-1))
-	end = min(len(m.resList), start+h)
-
-	return
 }
