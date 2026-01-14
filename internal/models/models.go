@@ -55,6 +55,15 @@ type Application struct {
 
 	// application.status.operationState.message.
 	OperationMessage string
+
+	Resources []SyncResources
+}
+
+type SyncResources struct {
+	Group     string
+	Kind      string
+	Name      string
+	Namespace string
 }
 
 // Inventory contains all discovered apps grouped by AppKey.
@@ -86,6 +95,8 @@ type RunOptions struct {
 	WaitHealthy  bool
 	WaitTimeout  time.Duration
 	PollInterval time.Duration
+
+	Resources []SyncResources
 }
 
 type TaskStatus string

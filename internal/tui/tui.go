@@ -42,6 +42,7 @@ type step int
 const (
 	stepLoading step = iota
 	stepSelectApps
+	stepSelectResources
 	stepSelectClusters
 	stepSelectAction
 	stepConfirm
@@ -72,13 +73,18 @@ type model struct {
 	height int
 
 	appOffset int
+	resOffset int
 	clOffset  int
 
-	appKeysAll   []models.AppKey
-	appKeys      []models.AppKey
-	appSelected  map[models.AppKey]bool
-	clusterNames []string
-	clSelected   map[string]bool
+	appKeysAll    []models.AppKey
+	appKeys       []models.AppKey
+	appSelected   map[models.AppKey]bool
+	resApps       []models.AppKey
+	resAppIdx     int
+	resList       []models.SyncResources
+	resSelectedBy map[models.AppKey]map[models.SyncResources]bool
+	clusterNames  []string
+	clSelected    map[string]bool
 
 	filtering  bool
 	filter     textinput.Model
@@ -114,22 +120,23 @@ func newModel(ctx context.Context, logger *slog.Logger, api argocd.API, opts Opt
 	ti.Width = 40
 	ti.Blur()
 	return &model{
-		rootCtx:     runCtx,
-		cancel:      cancel,
-		logger:      logger,
-		api:         api,
-		discover:    services.NewDiscoveryService(api),
-		bulk:        services.NewBulkService(api, opts.Parallel),
-		step:        stepLoading,
-		appSelected: map[models.AppKey]bool{},
-		clSelected:  map[string]bool{},
-		filter:      ti,
-		statuses:    map[models.Target]models.TaskStatus{},
-		messages:    map[models.Target]string{},
-		errors:      map[models.Target]error{},
-		beforeState: map[models.Target]models.Application{},
-		afterState:  map[models.Target]models.Application{},
-		action:      models.ActionSync,
+		rootCtx:       runCtx,
+		cancel:        cancel,
+		logger:        logger,
+		api:           api,
+		discover:      services.NewDiscoveryService(api),
+		bulk:          services.NewBulkService(api, opts.Parallel),
+		step:          stepLoading,
+		appSelected:   map[models.AppKey]bool{},
+		resSelectedBy: map[models.AppKey]map[models.SyncResources]bool{},
+		clSelected:    map[string]bool{},
+		filter:        ti,
+		statuses:      map[models.Target]models.TaskStatus{},
+		messages:      map[models.Target]string{},
+		errors:        map[models.Target]error{},
+		beforeState:   map[models.Target]models.Application{},
+		afterState:    map[models.Target]models.Application{},
+		action:        models.ActionSync,
 		runOpts: models.RunOptions{
 			Wait:         !opts.NoWait,
 			WaitHealthy:  !opts.NoWait,
@@ -348,6 +355,8 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case stepSelectApps:
 		return m.onKeySelectApps(msg)
+	case stepSelectResources:
+		return m.onKeySelectResources(msg)
 	case stepSelectClusters:
 		return m.onKeySelectClusters(msg)
 	case stepSelectAction:
@@ -479,6 +488,9 @@ func (m *model) onKeySelectApps(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		cl, err := services.ClustersForApps(m.inv, apps)
+		m.resApps = apps
+		m.resAppIdx = 0
+		m.ResList = resourcesForApp()
 		if err != nil {
 			m.step = stepError
 			m.err = err
@@ -905,17 +917,8 @@ func (m *model) viewSelectApps(s uiStyles) string {
 		sort.Strings(clusters)
 		for _, c := range clusters {
 			a := m.inv[k][c]
-			verLabel := "version=unknown"
-			if cl, ok := m.clusterBy[c]; ok {
-				if v := strings.TrimSpace(cl.ServerVersion); v != "" {
-					verLabel = "version=" + v
-				} else if cl.ServerMajor > 0 {
-					verLabel = fmt.Sprintf("version=v%d.x", cl.ServerMajor)
-				}
-			}
-			b.WriteString(fmt.Sprintf("  %-24s %-18s %s  %s\n",
+			b.WriteString(fmt.Sprintf("  %-24s %s  %s\n",
 				c,
-				s.dim.Render(verLabel),
 				renderAppHealth(s, a.HealthStatus),
 				renderAppSync(s, a.SyncStatus),
 			))
@@ -926,7 +929,7 @@ func (m *model) viewSelectApps(s uiStyles) string {
 
 func (m *model) viewSelectClusters(s uiStyles) string {
 	var b strings.Builder
-	b.WriteString(fitLine(m.width, s.header.Render("Step 2/3: Select Clusters")))
+	b.WriteString(fitLine(m.width, s.header.Render("Step 2/4: Select Clusters")))
 	b.WriteString("\n")
 	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | Backspace back | Enter next | q quit")))
 	b.WriteString("\n\n")
@@ -968,7 +971,7 @@ func (m *model) viewSelectAction(s uiStyles) string {
 	}
 
 	var b strings.Builder
-	b.WriteString(fitLine(m.width, s.header.Render("Step 3/3: Operation")))
+	b.WriteString(fitLine(m.width, s.header.Render("Step 4/4: Operation")))
 	b.WriteString("\n")
 	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | Enter run | Backspace back | q quit")))
 	b.WriteString("\n\n")
@@ -1276,8 +1279,12 @@ func (m *model) resetToStart() {
 	m.clOffset = 0
 
 	m.appSelected = map[models.AppKey]bool{}
+	m.resSelectedBy = map[models.AppKey]map[models.SyncResources]bool{}
 	m.clSelected = map[string]bool{}
 	m.clusterNames = nil
+	m.resApps = nil
+	m.resAppIdx = 0
+	m.resList = nil
 
 	m.actionIdx = 0
 	m.action = models.ActionSync
@@ -1298,6 +1305,9 @@ func (m *model) ensureVisible() {
 	case stepSelectApps:
 		h := m.appsListHeight()
 		m.appOffset = ensureOffset(m.appOffset, m.cursor, h, len(m.appKeys))
+	case stepSelectResources:
+		h := m.resourcesListHeight()
+		m.resOffset = ensureOffset(m.resOffset, m.cursor, h, len(m.resList))
 	case stepSelectClusters:
 		h := m.clustersListHeight()
 		m.clOffset = ensureOffset(m.clOffset, m.cursor, h, len(m.clusterNames))
@@ -1530,4 +1540,181 @@ func parseSyncWaitMessage(msg string) (operation, sync, health string, ok bool) 
 		}
 	}
 	return operation, sync, health, opOK && syncOK && healthOK
+}
+
+func (m *model) onKeySelectResources(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc":
+		return m, tea.Quit
+	case "backspace":
+		m.cursor = 0
+		m.appOffset = 0
+		m.step = stepSelectApps
+		return m, nil
+	case "up":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+		m.ensureVisible()
+		return m, nil
+	case "down":
+		if m.cursor < len(m.resList)-1 {
+			m.cursor++
+		}
+		m.ensureVisible()
+		return m, nil
+	case "pgup":
+		h := m.resourcesListHeight()
+		if h <= 0 {
+			h = 10
+		}
+		m.cursor -= h
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		m.ensureVisible()
+		return m, nil
+	case "pgdown":
+		h := m.resourcesListHeight()
+		if h <= 0 {
+			h = 10
+		}
+		m.cursor += h
+		if m.cursor > len(m.resList)-1 {
+			m.cursor = len(m.resList) - 1
+		}
+		m.ensureVisible()
+		return m, nil
+	case " ":
+		if len(m.resList) == 0 {
+			return m, nil
+		}
+		r := m.resList[m.cursor]
+		app := m.resApps[m.resAppIdx]
+		if m.resSelectedBy[app] == nil {
+			m.resSelectedBy[app] = map[models.SyncResources]bool{}
+		}
+		m.resSelectedBy[app][r] = !m.resSelectedBy[app][r]
+		return m, nil
+	case "a":
+		all := true
+		app := m.resApps[m.resAppIdx]
+		for _, r := range m.resList {
+			if m.resSelectedBy[app] == nil || !m.resSelectedBy[app][r] {
+				all = false
+				break
+			}
+		}
+		if m.resSelectedBy[app] == nil {
+			m.resSelectedBy[app] = map[models.SyncResources]bool{}
+		}
+
+		for _, r := range m.resList {
+			m.resSelectedBy[app][r] = !all
+		}
+		return m, nil
+	case "enter":
+		app := m.resApps[m.resAppIdx]
+		if len(m.selectedResourcesFor(app)) == 0 {
+			// resources are required for each selected app
+			return m, nil
+		}
+		// advance to next app, or proceed to cluster selection
+		if m.resAppIdx < len(m.resApps)-1 {
+			m.resAppIdx++
+			m.resList = resourcesForApp(m.inv, m.resApps[m.resAppIdx])
+			m.cursor = 0
+			m.resOffset = 0
+			m.ensureVisible()
+			return m, nil
+		}
+		cl, err := services.ClustersForApps(m.inv, m.resApps)
+		if err != nil {
+			m.step = stepError
+			m.err = err
+			return m, nil
+		}
+		m.clusterNames = cl
+		m.clSelected = map[string]bool{}
+		for _, c := range cl {
+			m.clSelected[c] = true
+		}
+		m.cursor = 0
+		m.clOffset = 0
+		m.step = stepSelectClusters
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+func formatSyncResource(r models.SyncResources) string {
+	g := strings.TrimSpace(r.Group)
+	if g == "" {
+		g = "core"
+	}
+	ns := strings.TrimSpace(r.Namespace)
+	if ns == "" {
+		ns = "-"
+	}
+	return fmt.Sprintf("%s/%s %s/%s", g, r.Kind, ns, r.Name)
+}
+
+func resourcesForApp(inv models.Inventory, appKey models.AppKey) []models.SyncResources {
+	set := map[models.SyncResources]struct{}{}
+	perCluster, ok := inv[appKey]
+	if ok {
+		for _, app := range perCluster {
+			for _, r := range app.Resources {
+				if strings.TrimSpace(r.Kind) == "" || strings.TrimSpace(r.Name) == "" {
+					continue
+				}
+				set[r] = struct{}{}
+			}
+		}
+	}
+
+	out := make([]models.SyncResources, 0, len(set))
+	for r := range set {
+		out = append(out, r)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Group != b.Group {
+			return a.Group < b.Group
+		}
+
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+
+		if a.Namespace != b.Namespace {
+			return a.Namespace < b.Namespace
+		}
+		return a.Name < b.Name
+	})
+	return out
+}
+
+func (m *model) resourcesListHeight() int {
+	if m.height <= 0 {
+		return 20
+	}
+	header := 5
+	footer := 1
+	available := m.height - header - footer - 1
+	return max(5, available)
+}
+
+func (m *model) resourcesVisibleRange() (start, end int) {
+	h := m.resourcesListHeight()
+	if h <= 0 {
+		h = 20
+	}
+
+	start = clamp(m.resOffset, 0, max(0, len(m.resList)-1))
+	end = min(len(m.resList), start+h)
+
+	return
 }

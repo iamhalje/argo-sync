@@ -2,3 +2,4 @@
 bin/
 *.json
 argo-sync
+.DS_Store

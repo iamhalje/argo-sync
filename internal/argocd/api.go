@@ -33,12 +33,22 @@ func (a *GRPCAPI) ListApplications(ctx context.Context, cluster models.Cluster) 
 
 	out := make([]models.Application, 0, len(resp.Items))
 	for _, it := range resp.Items {
+		resources := make([]models.SyncResources, 0, len(it.Status.Resources))
+		for _, r := range it.Status.Resources {
+			resources = append(resources, models.SyncResources{
+				Group:     r.Group,
+				Kind:      r.Kind,
+				Name:      r.Name,
+				Namespace: r.Namespace,
+			})
+		}
 		out = append(out, models.Application{
 			Key:          models.AppKey{Name: it.Name},
 			Project:      it.Spec.Project,
 			Namespace:    it.Namespace,
 			SyncStatus:   string(it.Status.Sync.Status),
 			HealthStatus: string(it.Status.Health.Status),
+			Resources:    resources,
 			OperationPhase: func() string {
 				if it.Status.OperationState == nil {
 					return ""
@@ -93,6 +103,14 @@ func (a *GRPCAPI) SyncApplication(ctx context.Context, cluster models.Cluster, a
 		DryRun:       ptr(opts.DryRun),
 	}
 
+	if len(opts.Resources) > 0 {
+		req.Resources = make([]*argoappv1.SyncOperationResource, 0, len(opts.Resources))
+
+		for _, r := range opts.Resources {
+			req.Resources = append(req.Resources, &argoappv1.SyncOperationResource{Group: r.Group, Kind: r.Kind, Name: r.Name, Namespace: r.Namespace})
+		}
+	}
+
 	// Mirror argocd CLI:
 	// https://github.com/argoproj/argo-cd/blob/master/pkg/apis/application/v1alpha1/types.go#L1581
 	// - default strategy is "hook"
@@ -136,6 +154,20 @@ func (a *GRPCAPI) GetApplication(ctx context.Context, cluster models.Cluster, ap
 		SyncStatus:   string(resp.Status.Sync.Status),
 		HealthStatus: string(resp.Status.Health.Status),
 	}
+
+	if len(resp.Status.Resources) > 0 {
+		out.Resources = make([]models.SyncResources, 0, len(resp.Status.Resources))
+
+		for _, r := range resp.Status.Resources {
+			out.Resources = append(out.Resources, models.SyncResources{
+				Group:     r.Group,
+				Kind:      r.Kind,
+				Name:      r.Name,
+				Namespace: r.Namespace,
+			})
+		}
+	}
+
 	if resp.Status.OperationState != nil {
 		out.OperationPhase = string(resp.Status.OperationState.Phase)
 		out.OperationMessage = resp.Status.OperationState.Message
