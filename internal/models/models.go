@@ -56,10 +56,13 @@ type Application struct {
 	// application.status.operationState.message.
 	OperationMessage string
 
-	Resources []SyncResources
+	// application.status.resources (kind, namespace, name, group).
+	Resources []SyncResource
 }
 
-type SyncResources struct {
+// SyncResource identifies a single Kubernetes resource for partial sync.
+// It mirrors argocd's SyncOperationResource fields.
+type SyncResource struct {
 	Group     string
 	Kind      string
 	Name      string
@@ -96,7 +99,7 @@ type RunOptions struct {
 	WaitTimeout  time.Duration
 	PollInterval time.Duration
 
-	Resources []SyncResources
+	Resources []SyncResource
 }
 
 type TaskStatus string

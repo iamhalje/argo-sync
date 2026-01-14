@@ -33,9 +33,15 @@ func (a *GRPCAPI) ListApplications(ctx context.Context, cluster models.Cluster) 
 
 	out := make([]models.Application, 0, len(resp.Items))
 	for _, it := range resp.Items {
+<<<<<<< HEAD
 		resources := make([]models.SyncResources, 0, len(it.Status.Resources))
 		for _, r := range it.Status.Resources {
 			resources = append(resources, models.SyncResources{
+=======
+		resources := make([]models.SyncResource, 0, len(it.Status.Resources))
+		for _, r := range it.Status.Resources {
+			resources = append(resources, models.SyncResource{
+>>>>>>> cursor/-bc-70a3bc6c-cdc6-4cc7-b3a3-eabb8562f89c-956b
 				Group:     r.Group,
 				Kind:      r.Kind,
 				Name:      r.Name,
@@ -105,9 +111,19 @@ func (a *GRPCAPI) SyncApplication(ctx context.Context, cluster models.Cluster, a
 
 	if len(opts.Resources) > 0 {
 		req.Resources = make([]*argoappv1.SyncOperationResource, 0, len(opts.Resources))
+<<<<<<< HEAD
 
 		for _, r := range opts.Resources {
 			req.Resources = append(req.Resources, &argoappv1.SyncOperationResource{Group: r.Group, Kind: r.Kind, Name: r.Name, Namespace: r.Namespace})
+=======
+		for _, r := range opts.Resources {
+			req.Resources = append(req.Resources, &argoappv1.SyncOperationResource{
+				Group:     r.Group,
+				Kind:      r.Kind,
+				Name:      r.Name,
+				Namespace: r.Namespace,
+			})
+>>>>>>> cursor/-bc-70a3bc6c-cdc6-4cc7-b3a3-eabb8562f89c-956b
 		}
 	}
 
@@ -154,12 +170,10 @@ func (a *GRPCAPI) GetApplication(ctx context.Context, cluster models.Cluster, ap
 		SyncStatus:   string(resp.Status.Sync.Status),
 		HealthStatus: string(resp.Status.Health.Status),
 	}
-
 	if len(resp.Status.Resources) > 0 {
-		out.Resources = make([]models.SyncResources, 0, len(resp.Status.Resources))
-
+		out.Resources = make([]models.SyncResource, 0, len(resp.Status.Resources))
 		for _, r := range resp.Status.Resources {
-			out.Resources = append(out.Resources, models.SyncResources{
+			out.Resources = append(out.Resources, models.SyncResource{
 				Group:     r.Group,
 				Kind:      r.Kind,
 				Name:      r.Name,
@@ -167,7 +181,6 @@ func (a *GRPCAPI) GetApplication(ctx context.Context, cluster models.Cluster, ap
 			})
 		}
 	}
-
 	if resp.Status.OperationState != nil {
 		out.OperationPhase = string(resp.Status.OperationState.Phase)
 		out.OperationMessage = resp.Status.OperationState.Message
