@@ -99,8 +99,11 @@ type RunOptions struct {
 	WaitTimeout  time.Duration
 	PollInterval time.Duration
 
-	// Resources limits sync to a subset of application resources.
-	// If empty, Argo CD will sync all resources (default behavior).
+	// Resources optionally limits sync to a subset of application resources.
+	//
+	// Semantics: if empty, Argo CD syncs ALL resources (default behavior).
+	// Note: the TUI flow may require selecting resources per-app and will populate this
+	// field accordingly for each sync request.
 	Resources []SyncResource
 }
 
