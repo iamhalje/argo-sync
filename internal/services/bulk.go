@@ -27,7 +27,7 @@ func NewBulkService(api argocd.API, parallel int) *BulkService {
 }
 
 // Run executes action for all (cluster, app) targets that exist in inventory.
-func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByContext map[string]models.Cluster, selectedApps []models.AppKey, selectedClusters []string, action models.Action, opts models.RunOptions, events chan<- models.ProgressEvent) ([]models.Result, error) {
+func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByContext map[string]models.Cluster, selectedApps []models.AppKey, selectedClusters []string, resourcesByApp map[models.AppKey][]models.SyncResource, action models.Action, opts models.RunOptions, events chan<- models.ProgressEvent) ([]models.Result, error) {
 	targets := TargetsForSelection(inv, selectedApps, selectedClusters)
 	if len(targets) == 0 {
 		return nil, errors.New("no runnable targets")
@@ -95,7 +95,11 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 					}
 				}
 				emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskRunning, Action: action, Message: "submitted sync request"})
-				err = s.api.SyncApplication(ctx, cl, ref, opts)
+				syncOpts := opts
+				if resourcesByApp != nil {
+					syncOpts.Resources = resourcesByApp[t.App]
+				}
+				err = s.api.SyncApplication(ctx, cl, ref, syncOpts)
 				if err != nil {
 					// ah shit, sync already in progress
 					if opts.Wait && IsOpInProgressErr(err) {

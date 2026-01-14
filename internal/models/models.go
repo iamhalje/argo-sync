@@ -55,6 +55,18 @@ type Application struct {
 
 	// application.status.operationState.message.
 	OperationMessage string
+
+	// application.status.resources (kind, namespace, name, group).
+	Resources []SyncResource
+}
+
+// SyncResource identifies a single Kubernetes resource for partial sync.
+// It mirrors argocd's SyncOperationResource fields.
+type SyncResource struct {
+	Group     string
+	Kind      string
+	Name      string
+	Namespace string
 }
 
 // Inventory contains all discovered apps grouped by AppKey.
@@ -86,6 +98,10 @@ type RunOptions struct {
 	WaitHealthy  bool
 	WaitTimeout  time.Duration
 	PollInterval time.Duration
+
+	// Resources limits sync to a subset of application resources.
+	// If empty, Argo CD will sync all resources (default behavior).
+	Resources []SyncResource
 }
 
 type TaskStatus string
