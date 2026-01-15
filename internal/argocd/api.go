@@ -17,6 +17,7 @@ type API interface {
 	RefreshApplication(ctx context.Context, cluster models.Cluster, app models.AppRef, hard bool) error
 	SyncApplication(ctx context.Context, cluster models.Cluster, app models.AppRef, opts models.RunOptions) error
 	GetApplication(ctx context.Context, cluster models.Cluster, app models.AppRef) (models.Application, error)
+	ManagedResourceDiffs(ctx context.Context, clsuter models.Cluster, app models.AppRef, projcet string) ([]models.ResourceDiff, error)
 }
 
 func (a *GRPCAPI) ListApplications(ctx context.Context, cluster models.Cluster) ([]models.Application, error) {
@@ -172,6 +173,43 @@ func (a *GRPCAPI) GetApplication(ctx context.Context, cluster models.Cluster, ap
 	if resp.Status.OperationState != nil {
 		out.OperationPhase = string(resp.Status.OperationState.Phase)
 		out.OperationMessage = resp.Status.OperationState.Message
+	}
+	return out, nil
+}
+
+func (a *GRPCAPI) ManagedResourceDiffs(ctx context.Context, cluster models.Cluster, app models.AppRef, project string) ([]models.ResourceDiff, error) {
+	c, closeFn, err := a.appClient(cluster)
+	if err != nil {
+		return nil, err
+	}
+	defer closeFn()
+
+	req := &argoapp.ResourcesQuery{
+		ApplicationName: ptr(app.Name),
+		AppNamespace:    ptr(app.Namespace),
+	}
+	if project != "" {
+		req.Project = ptr(project)
+	}
+
+	resp, err := c.ManagedResources(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("%s/%s: managed resources: %w", cluster.ContextName, app.Name, err)
+	}
+
+	out := make([]models.ResourceDiff, 0, len(resp.Items))
+
+	for _, it := range resp.Items {
+		out = append(out, models.ResourceDiff{
+			Group:               it.Group,
+			Kind:                it.Kind,
+			Namespace:           it.Namespace,
+			Name:                it.Name,
+			Modified:            it.Modified,
+			Diff:                it.Diff,
+			NormalizedLiveState: it.NormalizedLiveState,
+			PredictedLiveState:  it.PredictedLiveState,
+		})
 	}
 	return out, nil
 }

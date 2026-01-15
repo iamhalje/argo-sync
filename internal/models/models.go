@@ -69,6 +69,20 @@ type SyncResource struct {
 	Namespace string
 }
 
+// TODO
+type ResourceDiff struct {
+	Group     string
+	Kind      string
+	Namespace string
+	Name      string
+
+	Modified bool
+
+	Diff                string
+	NormalizedLiveState string
+	PredictedLiveState  string
+}
+
 // Inventory contains all discovered apps grouped by AppKey.
 type Inventory map[AppKey]map[string]Application
 

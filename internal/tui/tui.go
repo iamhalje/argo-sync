@@ -42,6 +42,10 @@ type step int
 const (
 	stepLoading step = iota
 	stepSelectApps
+	stepDiffSelectCluster
+	stepDiffLoading
+	stepDiffResources
+	stepDiffDetail
 	stepSelectClusters
 	stepSelectResources
 	stepSelectAction
@@ -108,6 +112,17 @@ type model struct {
 	beforeState map[models.Target]models.Application
 	afterState  map[models.Target]models.Application
 
+	diffApp        models.AppKey
+	diffClusters   []string
+	diffClCursor   int
+	diffClOffset   int
+	diffItems      []models.ResourceDiff
+	diffResCursor  int
+	diffResOffset  int
+	diffDetailText []string
+	diffDetailOff  int
+	diffErr        error
+
 	cli Options
 }
 
@@ -165,6 +180,13 @@ type progressMsg models.ProgressEvent
 type eventsClosedMsg struct{}
 type runDoneMsg struct {
 	results []models.Result
+	err     error
+}
+
+type diffLoadedMsg struct {
+	app     models.AppKey
+	cluster string
+	items   []models.ResourceDiff
 	err     error
 }
 
@@ -326,6 +348,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.step = stepDone
 		return m, nil
+	case diffLoadedMsg:
+		if msg.err != nil {
+			m.diffErr = msg.err
+			m.step = stepDiffResources
+			m.diffItems = nil
+			m.diffResCursor = 0
+			m.diffResOffset = 0
+			return m, nil
+		}
+		m.diffErr = nil
+		m.diffItems = msg.items
+		m.diffResCursor = 0
+		m.diffResOffset = 0
+		m.step = stepDiffResources
+		return m, nil
 	default:
 		return m, nil
 	}
@@ -355,6 +392,18 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case stepSelectApps:
 		return m.onKeySelectApps(msg)
+	case stepDiffSelectCluster:
+		return m.onKeyDiffSelectCluster(msg)
+	case stepDiffLoading:
+		if msg.String() == "q" || msg.String() == "esc" {
+			m.step = stepDiffSelectCluster
+			return m, nil
+		}
+		return m, nil
+	case stepDiffResources:
+		return m.onKeyDiffResources(msg)
+	case stepDiffDetail:
+		return m.onKeyDiffDetail(msg)
 	case stepSelectClusters:
 		return m.onKeySelectClusters(msg)
 	case stepSelectResources:
@@ -504,6 +553,27 @@ func (m *model) onKeySelectApps(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor = 0
 		m.clOffset = 0
 		m.step = stepSelectClusters
+		return m, nil
+	case "d":
+		if len(m.appKeys) == 0 || m.cursor < 0 || m.cursor >= len(m.appKeys) {
+			return m, nil
+		}
+		k := m.appKeys[m.cursor]
+		clusters := make([]string, 0, len(m.inv[k]))
+		for c := range m.inv[k] {
+			clusters = append(clusters, c)
+		}
+		sort.Strings(clusters)
+		if len(clusters) == 0 {
+			return m, nil
+		}
+		m.diffApp = k
+		m.diffClusters = clusters
+		m.diffClCursor = 0
+		m.diffClOffset = 0
+		m.diffItems = nil
+		m.diffErr = nil
+		m.step = stepDiffSelectCluster
 		return m, nil
 	default:
 		return m, nil
@@ -775,6 +845,147 @@ func (m *model) onKeyConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+func (m *model) onKeyDiffSelectCluster(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc":
+		m.step = stepSelectApps
+		return m, nil
+	case "backspace":
+		m.step = stepSelectApps
+		return m, nil
+	case "up":
+		if m.diffClCursor > 0 {
+			m.diffClCursor--
+		}
+		m.diffEnsureVisible()
+		return m, nil
+	case "down":
+		if m.diffClCursor < len(m.diffClusters)-1 {
+			m.diffClCursor++
+		}
+		m.diffEnsureVisible()
+		return m, nil
+	case "pgup":
+		h := 10
+		m.diffClCursor -= h
+		if m.diffClCursor < 0 {
+			m.diffClCursor = 0
+		}
+		m.diffEnsureVisible()
+		return m, nil
+	case "pgdown":
+		h := 10
+		m.diffClCursor += h
+		if m.diffClCursor > len(m.diffClusters)-1 {
+			m.diffClCursor = len(m.diffClusters) - 1
+		}
+		m.diffEnsureVisible()
+		return m, nil
+	case "enter":
+		if len(m.diffClusters) == 0 || m.diffClCursor < 0 || m.diffClCursor >= len(m.diffClusters) {
+			return m, nil
+		}
+		cluster := m.diffClusters[m.diffClCursor]
+		return m, m.loadDiffCmd(m.diffApp, cluster)
+	default:
+		return m, nil
+	}
+}
+
+func (m *model) onKeyDiffResources(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "ecs":
+		m.step = stepSelectApps
+		return m, nil
+	case "backspace":
+		m.step = stepDiffSelectCluster
+		return m, nil
+	case "up":
+		if m.diffResCursor > 0 {
+			m.diffResCursor--
+		}
+		m.diffResEnsureVisible()
+		return m, nil
+	case "down":
+		if m.diffResCursor < len(m.diffItems)-1 {
+			m.diffResCursor++
+		}
+		m.diffResEnsureVisible()
+		return m, nil
+	case "pgup":
+		h := 10
+		m.diffResCursor -= h
+		if m.diffResCursor < 0 {
+			m.diffResCursor = 0
+		}
+		m.diffResEnsureVisible()
+		return m, nil
+	case "pgdown":
+		h := 10
+		m.diffResCursor += h
+		if m.diffResCursor > len(m.diffItems)-1 {
+			m.diffResCursor = len(m.diffItems) - 1
+		}
+		m.diffResEnsureVisible()
+		return m, nil
+	case "enter":
+		if len(m.diffItems) == 0 || m.diffResCursor < 0 || m.diffResCursor >= len(m.diffItems) {
+			return m, nil
+		}
+		it := m.diffItems[m.diffResCursor]
+		txt := it.Diff
+		if strings.TrimSpace(txt) == "" {
+			// fallback
+			if strings.TrimSpace(it.PredictedLiveState) != "" || strings.TrimSpace(it.NormalizedLiveState) != "" {
+				txt = "PredictedLiveState:\n" + it.PredictedLiveState + "\n\nNormalizedLiveState\n" + it.NormalizedLiveState
+			} else {
+				txt = "(no diff payload returned by argocd)"
+			}
+		}
+		m.diffDetailText = strings.Split(txt, "\n")
+		m.diffDetailOff = 0
+		m.step = stepDiffDetail
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+func (m *model) onKeyDiffDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc":
+		m.step = stepDiffResources
+		return m, nil
+	case "backspace":
+		m.step = stepDiffResources
+		return m, nil
+	case "up":
+		if m.diffDetailOff > 0 {
+			m.diffDetailOff--
+		}
+		return m, nil
+	case "down":
+		if m.diffDetailOff < max(0, len(m.diffDetailText)-1) {
+			m.diffDetailOff++
+		}
+		return m, nil
+	case "pgup":
+		m.diffDetailOff -= 10
+		if m.diffDetailOff < 0 {
+			m.diffDetailOff = 0
+		}
+		return m, nil
+	case "pgdown":
+		m.diffDetailOff += 10
+		if m.diffDetailOff > max(0, len(m.diffDetailText)-1) {
+			m.diffDetailOff = max(0, len(m.diffDetailText)-1)
+		}
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
 func (m *model) startRun() (tea.Model, tea.Cmd) {
 	m.step = stepRunning
 	m.statuses = map[models.Target]models.TaskStatus{}
@@ -863,6 +1074,12 @@ func (m *model) View() string {
 		return theme.header.Render("argo-sync") + "\n\n" + theme.error.Render(fmt.Sprintf("Error: %v", m.err)) + "\n\n" + theme.hint.Render("Enter/Esc to exit")
 	case stepSelectApps:
 		return m.viewSelectApps(theme)
+	case stepDiffSelectCluster:
+		return m.viewDiffSelectCluster(theme)
+	case stepDiffResources:
+		return m.viewDiffResources(theme)
+	case stepDiffDetail:
+		return m.viewDiffDetail(theme)
 	case stepSelectClusters:
 		return m.viewSelectClusters(theme)
 	case stepSelectResources:
@@ -875,6 +1092,8 @@ func (m *model) View() string {
 		return m.viewRunning(theme)
 	case stepDone:
 		return m.viewDone(theme)
+	case stepDiffLoading:
+		return theme.header.Render("Diff") + "\n\n" + "Loading diff...\n\n" + theme.hint.Render("Esc to cancel")
 	default:
 		return "unknown state"
 	}
@@ -950,7 +1169,7 @@ func (m *model) viewSelectApps(s uiStyles) string {
 	var b strings.Builder
 	b.WriteString(fitLine(m.width, s.header.Render("Step 1/4: Select Applications")))
 	b.WriteString("\n")
-	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | / or Ctrl+F filter | R refresh | Enter next | q quit")))
+	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | d diff | / or Ctrl+F filter | R refresh | Enter next | q quit")))
 	b.WriteString("\n")
 	if m.filtering || m.filter.Value() != "" {
 		if m.filtering {
@@ -1299,6 +1518,77 @@ func (m *model) viewDone(s uiStyles) string {
 	b.WriteString(fmt.Sprintf("%s %d\n", s.error.Render("failed:"), failed))
 	b.WriteString(fmt.Sprintf("%s %d\n", s.warn.Render("cancelled:"), cancelled))
 	b.WriteString(fmt.Sprintf("%s %d\n", s.dim.Render("pending:"), pending))
+
+	changed := 0
+	for _, t := range m.runTargets {
+		after, ok := m.afterState[t]
+		if !ok {
+			continue
+		}
+		before := m.beforeState[t]
+		if strings.TrimSpace(before.SyncStatus) != strings.TrimSpace(after.SyncStatus) || strings.TrimSpace(before.HealthStatus) != strings.TrimSpace(after.HealthStatus) {
+			changed++
+		}
+	}
+
+	if changed > 0 {
+		b.WriteString("\n")
+		b.WriteString(s.dim.Render(fmt.Sprintf("Status changes... (from wait loop): %d", changed)))
+		b.WriteString("\n")
+		shown := 0
+		for _, t := range m.runTargets {
+			if shown >= 10 {
+				break
+			}
+			after, ok := m.afterState[t]
+			if !ok {
+				continue
+			}
+			before := m.beforeState[t]
+			if strings.TrimSpace(before.SyncStatus) == strings.TrimSpace(after.SyncStatus) && strings.TrimSpace(before.HealthStatus) == strings.TrimSpace(after.HealthStatus) {
+				continue
+			}
+
+			b.WriteString(s.dim.Render(fmt.Sprintf("- %-24s %-40s %s/%s -> %s/%s", t.ClusterContext, t.App.Name, shortHealth(before.HealthStatus), shortSync(before.SyncStatus), shortHealth(after.HealthStatus), shortSync(after.SyncStatus))))
+			b.WriteString("\n")
+			shown++
+		}
+		if changed > shown {
+			b.WriteString(s.dim.Render(fmt.Sprintf("..and %d more", changed-shown)))
+			b.WriteString("\n")
+		}
+	}
+
+	if failed > 0 {
+		b.WriteString("\n")
+		b.WriteString(s.error.Render("Failures:"))
+		b.WriteString("\n")
+		shown := 0
+		for _, t := range m.runTargets {
+			if shown >= 5 {
+				break
+			}
+			if m.statuses[t] != models.TaskFailed {
+				continue
+			}
+			err := m.errors[t]
+			msg := ""
+			if err != nil {
+				msg = err.Error()
+			}
+			if msg == "" {
+				msg = "unknown error"
+			}
+			b.WriteString(s.dim.Render(fmt.Sprintf("- %-24s %-40s %s", t.ClusterContext, t.App.Name, truncate(msg, 120))))
+			b.WriteString("\n")
+			shown++
+		}
+		if failed > shown {
+			b.WriteString(s.dim.Render(fmt.Sprintf("…and %d more", failed-shown)))
+			b.WriteString("\n")
+		}
+	}
+
 	b.WriteString("\n")
 	b.WriteString(fitLine(m.width, s.hint.Render("r restart  Enter/q to exit")))
 
@@ -1792,4 +2082,146 @@ func parseSyncWaitMessage(msg string) (operation, sync, health string, ok bool) 
 		}
 	}
 	return operation, sync, health, opOK && syncOK && healthOK
+}
+
+func (m *model) loadDiffCmd(app models.AppKey, clusterCtx string) tea.Cmd {
+	m.step = stepDiffLoading
+	return func() tea.Msg {
+		cl, ok := m.clusterBy[clusterCtx]
+		if !ok {
+			return diffLoadedMsg{app: app, cluster: clusterCtx, err: fmt.Errorf("unknown cluster context %q", clusterCtx)}
+		}
+		meta, ok := m.inv[app][clusterCtx]
+		if !ok {
+			return diffLoadedMsg{app: app, cluster: clusterCtx, err: fmt.Errorf("app %q not found in context %q", app.Name, clusterCtx)}
+		}
+		ctx, cancel := context.WithTimeout(m.rootCtx, 30*time.Second)
+		defer cancel()
+
+		items, err := m.api.ManagedResourceDiffs(ctx, cl, models.AppRef{Name: app.Name, Namespace: meta.Namespace}, meta.Project)
+		return diffLoadedMsg{app: app, cluster: clusterCtx, items: items, err: err}
+	}
+}
+
+func (m *model) viewDiffSelectCluster(s uiStyles) string {
+	var b strings.Builder
+	b.WriteString(fitLine(m.width, s.header.Render("Diff: Select Cluster")))
+	b.WriteString("\n")
+	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | Enter load | Backspace/Esc back")))
+	b.WriteString("\n\n")
+	b.WriteString(s.dim.Render(fmt.Sprintf("Application: %s", m.diffApp.Name)))
+	b.WriteString("\n\n")
+
+	start, end := m.diffClustersVisibleRange()
+	for i := start; i < end; i++ {
+		c := m.diffClusters[i]
+		cursor := " "
+		if i == m.diffClCursor {
+			cursor = ">"
+		}
+		b.WriteString(fmt.Sprintf("%s %s\n", cursor, c))
+	}
+	if len(m.diffClusters) > 0 {
+		b.WriteString(s.dim.Render(fmt.Sprintf("Showing %d-%d of %d", start+1, end, len(m.diffClusters))))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func (m *model) viewDiffResources(s uiStyles) string {
+	var b strings.Builder
+	b.WriteString(fitLine(m.width, s.header.Render("Diff: Resources")))
+	b.WriteString("\n")
+	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | Enter details | Backspace back | Esc apps")))
+	b.WriteString("\n\n")
+
+	if m.diffErr != nil {
+		b.WriteString(s.error.Render("Error: " + m.diffErr.Error()))
+		b.WriteString("\n\n")
+	}
+
+	if len(m.diffItems) == 0 {
+		b.WriteString(s.dim.Render("no diff items returned"))
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	start, end := m.diffResourcesVisibleRange()
+
+	for i := start; i < end; i++ {
+		it := m.diffItems[i]
+		cursor := " "
+		if i == m.diffResCursor {
+			cursor = ">"
+		}
+
+		mod := " "
+		if it.Modified {
+			mod = "*"
+		}
+
+		ns := it.Namespace
+		if strings.TrimSpace(ns) == "" {
+			ns = "-"
+		}
+
+		b.WriteString(fmt.Sprintf("%s [%s] %s/%s %s/%s\n", cursor, mod, it.Group, it.Kind, ns, it.Name))
+	}
+	b.WriteString(s.dim.Render(fmt.Sprintf("Showing %d–%d of %d (* = modified)", start+1, end, len(m.diffItems))))
+	b.WriteString("\n")
+	return b.String()
+}
+
+func (m *model) viewDiffDetail(s uiStyles) string {
+	var b strings.Builder
+	b.WriteString(fitLine(m.width, s.header.Render("Diff: Details")))
+	b.WriteString("\n")
+	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ scroll | PgUp/PgDn | Backspace/Esc back")))
+	b.WriteString("\n\n")
+
+	if len(m.diffDetailText) == 0 {
+		b.WriteString(s.dim.Render("(empty)"))
+		return b.String()
+	}
+
+	h := m.height - 5
+
+	if h <= 0 {
+		h = 20
+	}
+
+	start := clamp(m.diffDetailOff, 0, max(0, len(m.diffDetailText)-1))
+	end := min(len(m.diffDetailText), start+h)
+
+	for i := start; i < end; i++ {
+		b.WriteString(fitLine(m.width, m.diffDetailText[i]))
+		b.WriteString("\n")
+	}
+
+	b.WriteString(s.dim.Render(fmt.Sprintf("Showing %d–%d of %d", start+1, end, len(m.diffDetailText))))
+	return b.String()
+}
+
+func (m *model) diffEnsureVisible() {
+	h := 10
+	m.diffClOffset = ensureOffset(m.diffClOffset, m.diffClCursor, h, len(m.diffClusters))
+}
+
+func (m *model) diffResEnsureVisible() {
+	h := 12
+	m.diffResOffset = ensureOffset(m.diffResOffset, m.diffResCursor, h, len(m.diffItems))
+}
+
+func (m *model) diffClustersVisibleRange() (start, end int) {
+	h := 12
+	start = clamp(m.diffClOffset, 0, max(0, len(m.diffClusters)-1))
+	end = min(len(m.diffClusters), start+h)
+	return start, end
+}
+
+func (m *model) diffResourcesVisibleRange() (start, end int) {
+	h := 12
+	start = clamp(m.diffResOffset, 0, max(0, len(m.diffItems)-1))
+	end = min(len(m.diffItems), start+h)
+	return start, end
 }
