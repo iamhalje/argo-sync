@@ -58,6 +58,9 @@ type Application struct {
 
 	// application.status.resources (kind, namespace, name, group).
 	Resources []SyncResource
+
+	// application.status.resources
+	ResourceStatuses []ResourceStatus
 }
 
 // SyncResource identifies a single Kubernetes resource for partial sync.
@@ -100,6 +103,9 @@ type RunOptions struct {
 	PollInterval time.Duration
 
 	Resources []SyncResource
+
+	// application.status.resources
+	ResourceStatuses []ResourceStatus
 }
 
 type TaskStatus string
@@ -134,4 +140,10 @@ type Result struct {
 	Action Action
 	Status TaskStatus
 	Err    error
+}
+
+type ResourceStatus struct {
+	Resource     SyncResource
+	SyncStatus   string
+	HealthStatus string
 }

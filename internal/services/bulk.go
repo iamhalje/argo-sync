@@ -52,7 +52,6 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 	for _, t := range targets {
 		t := t
 		g.Go(func() error {
-			// if the run was cancelled before starting this target, repot it as cancelled
 			select {
 			case <-ctx.Done():
 				err := ctx.Err()
@@ -109,6 +108,8 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 					}
 				}
 				if opts.Wait {
+					waitOpts := opts
+					waitOpts.Resources = syncOpts.Resources
 					if e := s.waitForHealthy(ctx, cl, t, ref, opts, emit); e != nil {
 						err = e
 					}
@@ -199,8 +200,38 @@ func (s *BulkService) waitForHealthy(ctx context.Context, cluster models.Cluster
 		synced := st.SyncStatus == "Synced"
 		healthy := st.HealthStatus == "Healthy"
 		healthUnknown := st.HealthStatus == "" || st.HealthStatus == "Unknown"
-
 		doneByOp := st.OperationPhase == "" || st.OperationPhase == "Succeeded"
+
+		// waiting only sync needed resources instead of waiting for the whole applicaiton to be Synced
+		if len(opts.Resources) > 0 && doneByOp {
+			byResource := map[models.SyncResource]models.ResourceStatus{}
+			for _, res := range st.ResourceStatuses {
+				byResource[res.Resource] = res
+			}
+
+			allSelectedSynced := true
+			for _, r := range opts.Resources {
+				res, ok := byResource[r]
+				if !ok {
+					allSelectedSynced = false
+					break
+				}
+				if strings.TrimSpace(res.SyncStatus) != "Synced" {
+					allSelectedSynced = false
+					break
+				}
+			}
+
+			if allSelectedSynced {
+				if !opts.WaitHealthy {
+					return nil
+				}
+				if healthy || healthUnknown {
+					return nil
+				}
+			}
+		}
+
 		if synced && doneByOp {
 			if !opts.WaitHealthy {
 				return nil
