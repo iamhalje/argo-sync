@@ -1516,7 +1516,7 @@ func (m *model) ensureVisible() {
 		h := m.clustersListHeight()
 		m.clOffset = ensureOffset(m.clOffset, m.cursor, h, len(m.clusterNames))
 	default:
-		// nothing
+		// fallback
 	}
 }
 

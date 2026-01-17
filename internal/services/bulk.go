@@ -96,7 +96,15 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 				emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskRunning, Action: action, Message: "submitted sync request"})
 				syncOpts := opts
 				if resourcesByApp != nil {
-					syncOpts.Resources = resourcesByApp[t.App]
+					selected := resourcesByApp[t.App]
+					syncOpts.Resources = filterResourcesForTarget(appMeta, selected)
+					emit(models.ProgressEvent{
+						At:      time.Now(),
+						Target:  t,
+						Phase:   models.TaskRunning,
+						Action:  action,
+						Message: fmt.Sprintf("resourc selection: selected=%d filtered=%d", len(selected), len(syncOpts.Resources)),
+					})
 				}
 				err = s.api.SyncApplication(ctx, cl, ref, syncOpts)
 				if err != nil {
@@ -180,6 +188,8 @@ func (s *BulkService) waitForHealthy(ctx context.Context, cluster models.Cluster
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 
+	seenOp := false
+
 	for {
 		st, err := s.api.GetApplication(ctx, cluster, app)
 		if err != nil {
@@ -187,6 +197,11 @@ func (s *BulkService) waitForHealthy(ctx context.Context, cluster models.Cluster
 		}
 
 		msg := fmt.Sprintf("operation=%s sync=%s health=%s", normEmpty(st.OperationPhase, "Unknown"), normEmpty(st.SyncStatus, "Unknown"), normEmpty(st.HealthStatus, "Unknown"))
+		if len(opts.Resources) > 0 {
+			msg += fmt.Sprintf(" mode=partial resources=%d", len(opts.Resources))
+		} else {
+			msg += " mode=app"
+		}
 		emit(models.ProgressEvent{At: time.Now(), Target: target, Phase: models.TaskRunning, Action: models.ActionSync, Message: msg})
 
 		if st.OperationPhase == "Failed" || st.OperationPhase == "Error" {
@@ -200,36 +215,16 @@ func (s *BulkService) waitForHealthy(ctx context.Context, cluster models.Cluster
 		synced := st.SyncStatus == "Synced"
 		healthy := st.HealthStatus == "Healthy"
 		healthUnknown := st.HealthStatus == "" || st.HealthStatus == "Unknown"
+
+		if strings.TrimSpace(st.OperationPhase) != "" {
+			seenOp = true
+		}
+
 		doneByOp := st.OperationPhase == "" || st.OperationPhase == "Succeeded"
 
 		// waiting only sync needed resources instead of waiting for the whole applicaiton to be Synced
-		if len(opts.Resources) > 0 && doneByOp {
-			byResource := map[models.SyncResource]models.ResourceStatus{}
-			for _, res := range st.ResourceStatuses {
-				byResource[res.Resource] = res
-			}
-
-			allSelectedSynced := true
-			for _, r := range opts.Resources {
-				res, ok := byResource[r]
-				if !ok {
-					allSelectedSynced = false
-					break
-				}
-				if strings.TrimSpace(res.SyncStatus) != "Synced" {
-					allSelectedSynced = false
-					break
-				}
-			}
-
-			if allSelectedSynced {
-				if !opts.WaitHealthy {
-					return nil
-				}
-				if healthy || healthUnknown {
-					return nil
-				}
-			}
+		if len(opts.Resources) > 0 && doneByOp && seenOp {
+			return nil
 		}
 
 		if synced && doneByOp {
