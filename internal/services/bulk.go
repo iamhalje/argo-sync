@@ -123,7 +123,7 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 				if opts.Wait {
 					waitOpts := opts
 					waitOpts.Resources = syncOpts.Resources
-					if e := s.waitForHealthy(ctx, cl, t, ref, opts, emit); e != nil {
+					if e := s.waitForHealthy(ctx, cl, t, ref, waitOpts, emit); e != nil {
 						err = e
 					}
 				}

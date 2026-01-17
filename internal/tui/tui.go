@@ -328,6 +328,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.step = stepDone
+		if !m.refreshing {
+			m.refreshing = true
+			return m, m.refreshCmd()
+		}
 		return m, nil
 	default:
 		return m, nil
@@ -379,6 +383,10 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "r":
 			m.resetToStart()
+			if !m.refreshing {
+				m.refreshing = true
+				return m, m.refreshCmd()
+			}
 			return m, nil
 		case "enter":
 			return m, tea.Quit
