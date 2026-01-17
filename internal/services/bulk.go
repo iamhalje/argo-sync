@@ -97,7 +97,7 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 				syncOpts := opts
 				if resourcesByApp != nil {
 					selected := resourcesByApp[t.App]
-					syncOpts.Resources = filterResourcesForTarget(appMeta, selected)
+					syncOpts.Resources = filterResourceForTarget(appMeta, selected)
 					emit(models.ProgressEvent{
 						At:      time.Now(),
 						Target:  t,
@@ -105,6 +105,11 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 						Action:  action,
 						Message: fmt.Sprintf("resourc selection: selected=%d filtered=%d", len(selected), len(syncOpts.Resources)),
 					})
+					if len(resourcesByApp[t.App]) > 0 && len(syncOpts.Resources) == 0 {
+						emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskRunning, Action: action, Message: "no selected resources eixsts in this cluster; skipping"})
+						resCh <- models.Result{Target: t, Action: action, Status: models.TaskSuccess}
+						return nil
+					}
 				}
 				err = s.api.SyncApplication(ctx, cl, ref, syncOpts)
 				if err != nil {
@@ -259,4 +264,23 @@ func cmp(a, b string) int {
 		return 1
 	}
 	return 0
+}
+
+func filterResourceForTarget(appMeta models.Application, selected []models.SyncResource) []models.SyncResource {
+	if len(appMeta.Resources) == 0 || len(selected) == 0 {
+		return nil
+	}
+
+	allowed := map[models.SyncResource]struct{}{}
+	for _, r := range appMeta.Resources {
+		allowed[r] = struct{}{}
+	}
+	out := make([]models.SyncResource, 0, len(selected))
+	for _, r := range selected {
+		if _, ok := allowed[r]; ok {
+			out = append(out, r)
+		}
+	}
+
+	return out
 }
