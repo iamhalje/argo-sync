@@ -52,7 +52,6 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 	for _, t := range targets {
 		t := t
 		g.Go(func() error {
-			// if the run was cancelled before starting this target, repot it as cancelled
 			select {
 			case <-ctx.Done():
 				err := ctx.Err()
@@ -97,7 +96,20 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 				emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskRunning, Action: action, Message: "submitted sync request"})
 				syncOpts := opts
 				if resourcesByApp != nil {
-					syncOpts.Resources = resourcesByApp[t.App]
+					selected := resourcesByApp[t.App]
+					syncOpts.Resources = filterResourceForTarget(appMeta, selected)
+					emit(models.ProgressEvent{
+						At:      time.Now(),
+						Target:  t,
+						Phase:   models.TaskRunning,
+						Action:  action,
+						Message: fmt.Sprintf("resourc selection: selected=%d filtered=%d", len(selected), len(syncOpts.Resources)),
+					})
+					if len(resourcesByApp[t.App]) > 0 && len(syncOpts.Resources) == 0 {
+						emit(models.ProgressEvent{At: time.Now(), Target: t, Phase: models.TaskRunning, Action: action, Message: "no selected resources eixsts in this cluster; skipping"})
+						resCh <- models.Result{Target: t, Action: action, Status: models.TaskSuccess}
+						return nil
+					}
 				}
 				err = s.api.SyncApplication(ctx, cl, ref, syncOpts)
 				if err != nil {
@@ -109,7 +121,9 @@ func (s *BulkService) Run(ctx context.Context, inv models.Inventory, clustersByC
 					}
 				}
 				if opts.Wait {
-					if e := s.waitForHealthy(ctx, cl, t, ref, opts, emit); e != nil {
+					waitOpts := opts
+					waitOpts.Resources = syncOpts.Resources
+					if e := s.waitForHealthy(ctx, cl, t, ref, waitOpts, emit); e != nil {
 						err = e
 					}
 				}
@@ -179,6 +193,8 @@ func (s *BulkService) waitForHealthy(ctx context.Context, cluster models.Cluster
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 
+	seenOp := false
+
 	for {
 		st, err := s.api.GetApplication(ctx, cluster, app)
 		if err != nil {
@@ -186,6 +202,11 @@ func (s *BulkService) waitForHealthy(ctx context.Context, cluster models.Cluster
 		}
 
 		msg := fmt.Sprintf("operation=%s sync=%s health=%s", normEmpty(st.OperationPhase, "Unknown"), normEmpty(st.SyncStatus, "Unknown"), normEmpty(st.HealthStatus, "Unknown"))
+		if len(opts.Resources) > 0 {
+			msg += fmt.Sprintf(" mode=partial resources=%d", len(opts.Resources))
+		} else {
+			msg += " mode=app"
+		}
 		emit(models.ProgressEvent{At: time.Now(), Target: target, Phase: models.TaskRunning, Action: models.ActionSync, Message: msg})
 
 		if st.OperationPhase == "Failed" || st.OperationPhase == "Error" {
@@ -200,7 +221,17 @@ func (s *BulkService) waitForHealthy(ctx context.Context, cluster models.Cluster
 		healthy := st.HealthStatus == "Healthy"
 		healthUnknown := st.HealthStatus == "" || st.HealthStatus == "Unknown"
 
+		if strings.TrimSpace(st.OperationPhase) != "" {
+			seenOp = true
+		}
+
 		doneByOp := st.OperationPhase == "" || st.OperationPhase == "Succeeded"
+
+		// waiting only sync needed resources instead of waiting for the whole applicaiton to be Synced
+		if len(opts.Resources) > 0 && doneByOp && seenOp {
+			return nil
+		}
+
 		if synced && doneByOp {
 			if !opts.WaitHealthy {
 				return nil
@@ -233,4 +264,23 @@ func cmp(a, b string) int {
 		return 1
 	}
 	return 0
+}
+
+func filterResourceForTarget(appMeta models.Application, selected []models.SyncResource) []models.SyncResource {
+	if len(appMeta.Resources) == 0 || len(selected) == 0 {
+		return nil
+	}
+
+	allowed := map[models.SyncResource]struct{}{}
+	for _, r := range appMeta.Resources {
+		allowed[r] = struct{}{}
+	}
+	out := make([]models.SyncResource, 0, len(selected))
+	for _, r := range selected {
+		if _, ok := allowed[r]; ok {
+			out = append(out, r)
+		}
+	}
+
+	return out
 }

@@ -19,6 +19,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// TODO: comments all fields
+
 type Options struct {
 	ConfigPath   string
 	Contexts     []string
@@ -82,6 +84,7 @@ type model struct {
 	resApps       []models.AppKey
 	resAppIdx     int
 	resList       []models.SyncResource
+	resAgg        map[models.SyncResource]resourcesAgg
 	resSelectedBy map[models.AppKey]map[models.SyncResource]bool
 	clusterNames  []string
 	clSelected    map[string]bool
@@ -325,6 +328,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.step = stepDone
+		if !m.refreshing {
+			m.refreshing = true
+			return m, m.refreshCmd()
+		}
 		return m, nil
 	default:
 		return m, nil
@@ -376,6 +383,10 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "r":
 			m.resetToStart()
+			if !m.refreshing {
+				m.refreshing = true
+				return m, m.refreshCmd()
+			}
 			return m, nil
 		case "enter":
 			return m, tea.Quit
@@ -482,6 +493,14 @@ func (m *model) onKeySelectApps(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.appSelected[k] = !all
 		}
 		return m, nil
+	case "n":
+		// select all not synced apps
+		for _, k := range m.appKeys {
+			if !m.isAppFullySynced(k) {
+				m.appSelected[k] = true
+			}
+		}
+		return m, nil
 	case "enter":
 		apps := m.selectedApps()
 		if len(apps) == 0 {
@@ -580,6 +599,19 @@ func (m *model) onKeySelectResources(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.resSelectedBy[app][r] = !all
 		}
 		return m, nil
+	case "n":
+		// select all not synced resources
+		app := m.resApps[m.resAppIdx]
+		if m.resSelectedBy[app] == nil {
+			m.resSelectedBy[app] = map[models.SyncResource]bool{}
+		}
+		for _, r := range m.resList {
+			agg := m.resAgg[r]
+			if agg.Total == 0 || agg.OutOfSync > 0 || agg.Unknown > 0 || agg.Synced < agg.Total {
+				m.resSelectedBy[app][r] = true
+			}
+		}
+		return m, nil
 	case "enter":
 		app := m.resApps[m.resAppIdx]
 		if len(m.selectedResourcesFor(app)) == 0 {
@@ -590,6 +622,7 @@ func (m *model) onKeySelectResources(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.resAppIdx < len(m.resApps)-1 {
 			m.resAppIdx++
 			m.resList = resourcesForAppInClusters(m.inv, m.resApps[m.resAppIdx], m.selectedClusters())
+			m.resAgg = aggregateResourceAgg(m.inv, m.resApps[m.resAppIdx], m.selectedClusters(), m.resList)
 			m.cursor = 0
 			m.resOffset = 0
 			m.ensureVisible()
@@ -679,6 +712,7 @@ func (m *model) onKeySelectClusters(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.resApps = apps
 		m.resAppIdx = 0
 		m.resList = resourcesForAppInClusters(m.inv, apps[0], clusters)
+		m.resAgg = aggregateResourceAgg(m.inv, apps[0], clusters, m.resList)
 		m.resSelectedBy = map[models.AppKey]map[models.SyncResource]bool{}
 		m.cursor = 0
 		m.resOffset = 0
@@ -950,7 +984,7 @@ func (m *model) viewSelectApps(s uiStyles) string {
 	var b strings.Builder
 	b.WriteString(fitLine(m.width, s.header.Render("Step 1/4: Select Applications")))
 	b.WriteString("\n")
-	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | / or Ctrl+F filter | R refresh | Enter next | q quit")))
+	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | n select not synced | / or Ctrl+F filter | R refresh | Enter next | q quit")))
 	b.WriteString("\n")
 	if m.filtering || m.filter.Value() != "" {
 		if m.filtering {
@@ -1071,7 +1105,7 @@ func (m *model) viewSelectResources(s uiStyles) string {
 	}
 	b.WriteString(fitLine(m.width, s.header.Render(title)))
 	b.WriteString("\n")
-	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | Backspace back | Enter next app | q quit")))
+	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | n select not synced | Backspace back | Enter next app | q quit")))
 	b.WriteString("\n")
 
 	selected := 0
@@ -1097,7 +1131,7 @@ func (m *model) viewSelectResources(s uiStyles) string {
 		if app.Name != "" && m.resSelectedBy[app] != nil && m.resSelectedBy[app][r] {
 			check = "[x]"
 		}
-		b.WriteString(fmt.Sprintf("%s %s %s\n", cursor, check, formatSyncResource(r)))
+		b.WriteString(fmt.Sprintf("%s %s %-18s %s\n", cursor, check, renderResourcesSyncAgg(s, m.resAgg[r]), formatSyncResource(r)))
 	}
 	b.WriteString(s.dim.Render(fmt.Sprintf("Showing %d–%d of %d", start+1, end, len(m.resList))))
 	return b.String()
@@ -1107,7 +1141,7 @@ func (m *model) viewSelectClusters(s uiStyles) string {
 	var b strings.Builder
 	b.WriteString(fitLine(m.width, s.header.Render("Step 2/4: Select Clusters")))
 	b.WriteString("\n")
-	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | Backspace back | Enter next | q quit")))
+	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | n select not synced | Backspace back | Enter next | q quit")))
 	b.WriteString("\n\n")
 
 	start, end := m.clustersVisibleRange()
@@ -1462,6 +1496,7 @@ func (m *model) resetToStart() {
 	m.resApps = nil
 	m.resAppIdx = 0
 	m.resList = nil
+	m.resAgg = nil
 
 	m.actionIdx = 0
 	m.action = models.ActionSync
@@ -1489,7 +1524,7 @@ func (m *model) ensureVisible() {
 		h := m.clustersListHeight()
 		m.clOffset = ensureOffset(m.clOffset, m.cursor, h, len(m.clusterNames))
 	default:
-		// nothing
+		// fallback
 	}
 }
 
@@ -1792,4 +1827,107 @@ func parseSyncWaitMessage(msg string) (operation, sync, health string, ok bool) 
 		}
 	}
 	return operation, sync, health, opOK && syncOK && healthOK
+}
+
+type resourcesAgg struct {
+	Synced    int
+	OutOfSync int
+	Unknown   int
+	Total     int
+}
+
+func renderResourcesSyncAgg(s uiStyles, agg resourcesAgg) string {
+	label := "sync=Unknown"
+
+	switch {
+	case agg.Total > 0 && agg.Synced == agg.Total:
+		label = fmt.Sprintf("sync=Synced(%d/%d)", agg.Synced, agg.Total)
+	case agg.OutOfSync > 0:
+		label = fmt.Sprintf("sync=OutOfSync(%d/%d)", agg.OutOfSync, agg.Total)
+	case agg.Total > 0 && agg.Unknown > 0:
+		label = fmt.Sprintf("sync=Unknown(%d/%d)", agg.Unknown, agg.Total)
+	case agg.Total > 0:
+		label = fmt.Sprintf("sync=Mixed(%d/%d)", agg.Synced, agg.Total)
+	}
+
+	switch {
+	case strings.Contains(label, "Synced"):
+		return s.ok.Render(label)
+	case strings.Contains(label, "OutOfSync"):
+		return s.warn.Render(label)
+	default:
+		return s.dim.Render(label)
+	}
+}
+
+func aggregateResourceAgg(inv models.Inventory, appKey models.AppKey, clusters []string, list []models.SyncResource) map[models.SyncResource]resourcesAgg {
+
+	out := make(map[models.SyncResource]resourcesAgg)
+
+	perCluster, ok := inv[appKey]
+	if !ok {
+		return out
+	}
+
+	allowed := map[string]struct{}{}
+	for _, c := range clusters {
+		allowed[c] = struct{}{}
+	}
+
+	// per index == per cluster / resource statuses
+	statusByCluster := map[string]map[models.SyncResource]models.ResourceStatus{}
+	for ctx, app := range perCluster {
+		if len(allowed) > 0 {
+			if _, ok := allowed[ctx]; !ok {
+				continue
+			}
+		}
+
+		mm := map[models.SyncResource]models.ResourceStatus{}
+		for _, rs := range app.ResourceStatuses {
+			mm[rs.Resource] = rs
+		}
+		statusByCluster[ctx] = mm
+	}
+
+	for _, r := range list {
+		agg := out[r]
+		for ctx := range statusByCluster {
+			agg.Total++
+			rs, ok := statusByCluster[ctx][r]
+			if !ok {
+				agg.Unknown++
+				continue
+			}
+			st := strings.TrimSpace(rs.SyncStatus)
+			switch st {
+			case "Synced":
+				agg.Synced++
+			case "OutOfSync":
+				agg.OutOfSync++
+			case "", "Unknown":
+				agg.Unknown++
+			default:
+				agg.Unknown++
+			}
+		}
+		out[r] = agg
+	}
+
+	return out
+}
+
+func (m *model) isAppFullySynced(k models.AppKey) bool {
+	perCluster, ok := m.inv[k]
+	if !ok || len(perCluster) == 0 {
+		return false
+	}
+
+	for _, app := range perCluster {
+		if strings.TrimSpace(app.SyncStatus) != "Synced" {
+			return false
+		}
+	}
+
+	return true
 }

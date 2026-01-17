@@ -34,21 +34,34 @@ func (a *GRPCAPI) ListApplications(ctx context.Context, cluster models.Cluster) 
 	out := make([]models.Application, 0, len(resp.Items))
 	for _, it := range resp.Items {
 		resources := make([]models.SyncResource, 0, len(it.Status.Resources))
+		resourceStatuses := make([]models.ResourceStatus, 0, len(it.Status.Resources))
 		for _, r := range it.Status.Resources {
-			resources = append(resources, models.SyncResource{
+			sr := models.SyncResource{
 				Group:     r.Group,
 				Kind:      r.Kind,
 				Name:      r.Name,
 				Namespace: r.Namespace,
+			}
+			resources = append(resources, sr)
+
+			health := ""
+			if r.Health != nil {
+				health = string(r.Health.Status)
+			}
+			resourceStatuses = append(resourceStatuses, models.ResourceStatus{
+				Resource:     sr,
+				SyncStatus:   string(r.Status),
+				HealthStatus: health,
 			})
 		}
 		out = append(out, models.Application{
-			Key:          models.AppKey{Name: it.Name},
-			Project:      it.Spec.Project,
-			Namespace:    it.Namespace,
-			SyncStatus:   string(it.Status.Sync.Status),
-			HealthStatus: string(it.Status.Health.Status),
-			Resources:    resources,
+			Key:              models.AppKey{Name: it.Name},
+			Project:          it.Spec.Project,
+			Namespace:        it.Namespace,
+			SyncStatus:       string(it.Status.Sync.Status),
+			HealthStatus:     string(it.Status.Health.Status),
+			Resources:        resources,
+			ResourceStatuses: resourceStatuses,
 			OperationPhase: func() string {
 				if it.Status.OperationState == nil {
 					return ""
@@ -160,12 +173,25 @@ func (a *GRPCAPI) GetApplication(ctx context.Context, cluster models.Cluster, ap
 	}
 	if len(resp.Status.Resources) > 0 {
 		out.Resources = make([]models.SyncResource, 0, len(resp.Status.Resources))
+		out.ResourceStatuses = make([]models.ResourceStatus, 0, len(resp.Status.Resources))
 		for _, r := range resp.Status.Resources {
-			out.Resources = append(out.Resources, models.SyncResource{
+			sr := models.SyncResource{
 				Group:     r.Group,
 				Kind:      r.Kind,
 				Name:      r.Name,
 				Namespace: r.Namespace,
+			}
+			out.Resources = append(out.Resources, sr)
+
+			health := ""
+			if r.Health != nil {
+				health = string(r.Health.Status)
+			}
+
+			out.ResourceStatuses = append(out.ResourceStatuses, models.ResourceStatus{
+				Resource:     sr,
+				SyncStatus:   string(r.Status),
+				HealthStatus: health,
 			})
 		}
 	}
