@@ -86,6 +86,7 @@ type model struct {
 	resList       []models.SyncResource
 	resAgg        map[models.SyncResource]resourcesAgg
 	resSelectedBy map[models.AppKey]map[models.SyncResource]bool
+	resSkipped    int
 	clusterNames  []string
 	clSelected    map[string]bool
 
@@ -551,6 +552,9 @@ func (m *model) onKeySelectResources(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.ensureVisible()
 		return m, nil
 	case "pgup":
+		if len(m.resList) == 0 {
+			return m, nil
+		}
 		h := m.resourcesListHeight()
 		if h <= 0 {
 			h = 10
@@ -562,6 +566,9 @@ func (m *model) onKeySelectResources(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.ensureVisible()
 		return m, nil
 	case "pgdown":
+		if len(m.resList) == 0 {
+			return m, nil
+		}
 		h := m.resourcesListHeight()
 		if h <= 0 {
 			h = 10
@@ -614,6 +621,9 @@ func (m *model) onKeySelectResources(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		app := m.resApps[m.resAppIdx]
+		if len(m.resList) == 0 {
+			return m, nil
+		}
 		if len(m.selectedResourcesFor(app)) == 0 {
 			// resources are required for each selected app
 			return m, nil
@@ -709,10 +719,27 @@ func (m *model) onKeySelectClusters(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(apps) == 0 {
 			return m, nil
 		}
-		m.resApps = apps
+
+		filtered := make([]models.AppKey, 0, len(apps))
+		skipped := 0
+		for _, a := range apps {
+			if len(resourcesForAppInClusters(m.inv, a, clusters)) == 0 {
+				skipped++
+				continue
+			}
+			filtered = append(filtered, a)
+		}
+		if len(filtered) == 0 {
+			m.step = stepError
+			m.err = fmt.Errorf("no selectable applications: resources unavailable for selected clusters")
+			return m, nil
+		}
+
+		m.resApps = filtered
 		m.resAppIdx = 0
-		m.resList = resourcesForAppInClusters(m.inv, apps[0], clusters)
-		m.resAgg = aggregateResourceAgg(m.inv, apps[0], clusters, m.resList)
+		m.resSkipped = skipped
+		m.resList = resourcesForAppInClusters(m.inv, filtered[0], clusters)
+		m.resAgg = aggregateResourceAgg(m.inv, filtered[0], clusters, m.resList)
 		m.resSelectedBy = map[models.AppKey]map[models.SyncResource]bool{}
 		m.cursor = 0
 		m.resOffset = 0
@@ -1107,6 +1134,11 @@ func (m *model) viewSelectResources(s uiStyles) string {
 	b.WriteString("\n")
 	b.WriteString(fitLine(m.width, s.hint.Render("↑/↓ move | PgUp/PgDn jump | Space toggle | a all/none | n select not synced | Backspace back | Enter next app | q quit")))
 	b.WriteString("\n")
+
+	if m.resSkipped > 0 {
+		b.WriteString(fitLine(m.width, s.warn.Render(fmt.Sprintf("Skipped %d app(s): resoruces unavailable for selected clusters", m.resSkipped))))
+		b.WriteString("\n")
+	}
 
 	selected := 0
 	if app.Name != "" {
@@ -1533,7 +1565,7 @@ func (m *model) appsVisibleRange() (start, end int) {
 	if h <= 0 {
 		h = 20
 	}
-	start = clamp(m.appOffset, 0, max(0, len(m.appKeys)-1))
+	start = clamp(m.appOffset, 0, max(0, len(m.appKeys)-h))
 	end = min(len(m.appKeys), start+h)
 	return start, end
 }
@@ -1543,7 +1575,7 @@ func (m *model) clustersVisibleRange() (start, end int) {
 	if h <= 0 {
 		h = 20
 	}
-	start = clamp(m.clOffset, 0, max(0, len(m.clusterNames)-1))
+	start = clamp(m.clOffset, 0, max(0, len(m.clusterNames)-h))
 	end = min(len(m.clusterNames), start+h)
 	return start, end
 }
@@ -1553,7 +1585,7 @@ func (m *model) resourcesVisibleRange() (start, end int) {
 	if h <= 0 {
 		h = 20
 	}
-	start = clamp(m.resOffset, 0, max(0, len(m.resList)-1))
+	start = clamp(m.resOffset, 0, max(0, len(m.resList)-h))
 	end = min(len(m.resList), start+h)
 	return start, end
 }
@@ -1701,13 +1733,16 @@ func ensureOffset(offset, cursor, height, total int) int {
 	if height <= 0 {
 		height = 1
 	}
+
+	maxOffSet := max(0, total-height)
+	offset = clamp(offset, 0, maxOffSet)
 	if cursor < offset {
-		return cursor
+		return clamp(cursor, 0, maxOffSet)
 	}
 	if cursor >= offset+height {
-		return cursor - height + 1
+		return clamp(cursor-height+1, 0, maxOffSet)
 	}
-	return offset
+	return clamp(offset, 0, maxOffSet)
 }
 
 func clamp(v, lo, hi int) int {
